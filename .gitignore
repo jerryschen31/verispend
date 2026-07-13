@@ -1,0 +1,10 @@
+node_modules/
+.wrangler/
+.dev.vars
+.env
+dist/
+worker-configuration.d.ts
+.DS_Store
+.prod-secrets.local
+prompts/
+wrangler.jsonc

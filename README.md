@@ -1,1 +1,68 @@
-# verispend
+# VeriSpend
+
+**Spend verification for AI agents.** A drop-in MCP server your agents call *before* spending money — policy check, human escalation, and an immutable audit ledger — plus a dashboard where finance reviews and approves. VeriSpend never moves money: agents pay on whatever rail they already use, and VeriSpend is the control plane a CFO can trust.
+
+## How it works
+
+1. An agent that wants to buy something calls the `request_purchase` MCP tool with vendor, amount, category, and justification.
+2. VeriSpend evaluates the org's versioned spend policy (caps, category/vendor rules, per-agent and org budgets) and returns `approved`, `denied`, or `pending_approval`.
+3. Escalated purchases email the approver a one-click approve/deny link and appear in the dashboard queue; the agent polls `check_approval`.
+4. After paying, the agent calls `record_outcome` — the final charge is recorded against the approval and budget counters are corrected.
+5. Every step is an append-only, hash-chained ledger event. The dashboard's Audit page re-verifies the whole chain on demand.
+
+## MCP tools
+
+| Tool | Purpose |
+|------|---------|
+| `request_purchase` | Ask for authorization before paying |
+| `check_approval` | Poll a pending human decision |
+| `record_outcome` | Report the final charge after purchase |
+| `get_budget_status` | Remaining agent/org budgets |
+
+Agents authenticate with a per-agent bearer key (`Authorization: Bearer vs_...`) against `https://<host>/mcp` (Streamable HTTP). Agent identity comes from the key — it can't be spoofed via tool arguments.
+
+## Development
+
+```sh
+npm install
+npx wrangler d1 migrations apply verispend --local
+npm run dev          # http://localhost:8787
+npm test             # vitest (workers pool), 35 tests
+npm run check        # typecheck
+```
+
+Provision a local org (admin key is in `.dev.vars`):
+
+```sh
+curl -X POST http://localhost:8787/api/admin/orgs \
+  -H "content-type: application/json" -H "x-admin-key: dev-admin-key" \
+  -d '{"name":"Demo Corp","agent_id":"my-agent","approver_email":"you@example.com"}'
+```
+
+The response contains the agent's API key (shown once). Connect any MCP client to `http://localhost:8787/mcp` with that bearer key.
+
+Dashboard: `http://localhost:8787/dashboard` — sign-in is Kinde OIDC (hosted login; Kinde sends its own auth emails). Access requires your email to match an org's `approver_email`. Local dev needs `KINDE_CLIENT_SECRET` in `.dev.vars`; `KINDE_DOMAIN`/`KINDE_CLIENT_ID` live in `wrangler.jsonc` vars.
+
+## Architecture
+
+- **Cloudflare Workers** — Hono app: MCP endpoint, approval links, server-rendered dashboard (Hono JSX, no build step)
+- **`McpAgent`** (Agents SDK) — MCP server over Streamable HTTP; auth happens in the Worker, identity flows in via `ctx.props`
+- **D1** — orgs, agent keys (hashed), versioned policies, purchase requests, hash-chained `ledger_events`
+- **Durable Object per org** (`OrgCoordinator`) — atomic budget counters and serialized ledger appends (prevents chain forks)
+- **Kinde (OIDC)** — dashboard login; no SDK, plain authorization-code flow
+- **Email Service** — approval notification emails (best-effort; requires Workers Paid + domain onboarding)
+
+## Deploy
+
+```sh
+npx wrangler login
+npx wrangler d1 create verispend            # put the id in wrangler.jsonc
+npx wrangler d1 migrations apply verispend --remote
+npx wrangler secret put ADMIN_KEY
+npx wrangler secret put SESSION_SECRET
+npx wrangler secret put KINDE_CLIENT_SECRET
+npx wrangler email sending enable verispend.com   # requires Workers Paid plan
+npm run deploy
+```
+
+Set `BASE_URL` in `wrangler.jsonc` vars to the deployed URL.
