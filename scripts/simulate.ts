@@ -11,6 +11,7 @@
 // Runs on plain Node ≥ 22.18 (native type stripping); no build step.
 
 import { McpHttpClient } from "./mcp-client.ts";
+import { verifyBundle, type VerifiableBundle } from "./verify-bundle.ts";
 
 declare const process: {
   argv: string[];
@@ -55,6 +56,14 @@ async function adminPost(path: string, body: unknown): Promise<any> {
     throw new Error(`${path} failed (${res.status}): ${JSON.stringify(json)}`);
   }
   return json;
+}
+
+async function adminGetText(path: string): Promise<string> {
+  const res = await fetch(`${BASE_URL}${path}`, {
+    headers: { "x-admin-key": ADMIN_KEY },
+  });
+  if (!res.ok) throw new Error(`${path} failed (${res.status})`);
+  return res.text();
 }
 
 // Policy tuned so every scenario resolves in seconds of wall-clock time.
@@ -254,12 +263,208 @@ async function main() {
     check(budget.agent.daily_used_cents === 0, "not a cent of budget was consumed");
   }
 
+  // ── Scenario 5: a team of agents racing one shared budget ──────────
+  section("Scenario 5 — research team: three agents race a $50 shared budget");
+  {
+    const team = await adminPost(`/api/admin/orgs/${orgId}/teams`, {
+      name: "research",
+      agent_ids: ["res-1", "res-2", "res-3"],
+      budgets: { dailyCents: 50_00 },
+    });
+    check(!!team.team_id, "team 'research' provisioned with a $50/day shared budget");
+
+    const researchers = await Promise.all(
+      ["res-1", "res-2", "res-3"].map((id) => agent(orgId, id))
+    );
+    const results: any[] = await Promise.all(
+      Array.from({ length: 10 }, (_, i) =>
+        researchers[i % 3].call("request_purchase", {
+          vendor: "TeamData",
+          amount_cents: 10_00,
+          currency: "USD",
+          category: "data",
+          justification: `parallel enrichment shard ${i + 1}/10`,
+        })
+      )
+    );
+    const approved = results.filter((r) => r.status === "approved");
+    const denied = results.filter((r) => r.status === "denied");
+    check(
+      approved.length === 5,
+      "exactly 5 of 10 concurrent $10 purchases fit the shared $50 budget",
+      `got ${approved.length}`
+    );
+    check(
+      denied.every((r) => r.rule_fired === "budget_team_daily"),
+      "every excess purchase was denied by the team budget",
+      `rules=${[...new Set(denied.map((r) => r.rule_fired))].join(",")}`
+    );
+    const sample = denied[0];
+    check(
+      sample?.budget?.scope === "team" && sample?.budget?.used_cents === 50_00,
+      "denials carry the failing scope: team budget fully used",
+      JSON.stringify(sample?.budget)
+    );
+    const status = await researchers[0].call("get_budget_status", {});
+    check(
+      status.team?.daily_used_cents === 50_00 &&
+        status.team?.daily_limit_cents === 50_00,
+      "every teammate sees the same shared team counters",
+      JSON.stringify(status.team)
+    );
+  }
+
+  // ── Scenario 6: team approval routing ──────────────────────────────
+  section("Scenario 6 — ops team: escalations route to the team's approver");
+  {
+    await adminPost(`/api/admin/orgs/${orgId}/members`, {
+      email: "lead@sim.test",
+      role: "approver",
+    });
+    await adminPost(`/api/admin/orgs/${orgId}/teams`, {
+      name: "ops",
+      agent_ids: ["ops-1"],
+      approver_emails: ["lead@sim.test"],
+    });
+    const ops = await agent(orgId, "ops-1");
+    const escalated = await ops.call("request_purchase", {
+      vendor: "Enterprise Tools GmbH",
+      amount_cents: 120_00,
+      currency: "USD",
+      category: "software",
+      justification: "workflow tooling — over the $100 human threshold",
+    });
+    check(escalated.status === "pending_approval", "ops-1's $120 purchase escalates");
+
+    const teamless = await good.call("request_purchase", {
+      vendor: "Enterprise Tools GmbH",
+      amount_cents: 110_00,
+      currency: "USD",
+      category: "software",
+      justification: "same tool, but from a teamless agent",
+    });
+    check(teamless.status === "pending_approval", "teamless escalation also pends");
+
+    // Routing is on the ledger (approval_routed), so it's observable without
+    // an inbox; the real emails show up in the `npm run dev` logs.
+    const bundle = JSON.parse(
+      await adminGetText(`/api/admin/orgs/${orgId}/export/audit-bundle.json`)
+    ) as VerifiableBundle;
+    const routedFor = (requestId: string) =>
+      bundle.events
+        .filter(
+          (e) => e.event_type === "approval_routed" && e.request_id === requestId
+        )
+        .map((e) => JSON.parse(e.payload_json))[0];
+
+    const teamRouted = routedFor(escalated.request_id);
+    check(
+      teamRouted?.source === "team" &&
+        teamRouted?.recipients?.includes("lead@sim.test"),
+      "ops-1's approval was routed to the team approver (source: team)",
+      JSON.stringify(teamRouted)
+    );
+    const orgRouted = routedFor(teamless.request_id);
+    check(
+      orgRouted?.source === "org" &&
+        orgRouted?.recipients?.includes("lead@sim.test"),
+      "the teamless escalation fell back to org-wide approvers (source: org)",
+      JSON.stringify(orgRouted)
+    );
+  }
+
+  // ── Scenario 7: explainable decisions ───────────────────────────────
+  section("Scenario 7 — explainability: every decision shows its work");
+  {
+    const printTrace = (label: string, trace: any[]) => {
+      console.log(`  ↳ ${label}:`);
+      for (const t of trace) {
+        const mark = t.result === "pass" ? "·" : t.result === "triggered" ? "✗" : "—";
+        console.log(
+          `      ${mark} ${t.rule.padEnd(24)} ${t.result.padEnd(10)} ${t.detail ?? ""}`
+        );
+      }
+    };
+
+    const ok = await good.call("request_purchase", {
+      vendor: "Notion",
+      amount_cents: 9_00,
+      currency: "USD",
+      category: "software",
+      justification: "workspace seat",
+    });
+    check(
+      ok.status === "approved" &&
+        ok.trace?.some(
+          (t: any) => t.rule === "budget_agent_daily" && t.result === "pass"
+        ),
+      "an approval's trace includes the budget math that passed"
+    );
+    printTrace("approved purchase trace", ok.trace ?? []);
+
+    const bad = await good.call("request_purchase", {
+      vendor: "SketchyData Inc",
+      amount_cents: 5_00,
+      currency: "USD",
+      category: "data",
+      justification: "should hit the deny list",
+    });
+    const triggered = (bad.trace ?? []).find((t: any) => t.result === "triggered");
+    check(
+      bad.status === "denied" && triggered?.rule === bad.rule_fired,
+      "a denial's triggered trace entry matches rule_fired",
+      `rule_fired=${bad.rule_fired}, triggered=${triggered?.rule}`
+    );
+    printTrace("denied purchase trace", bad.trace ?? []);
+  }
+
+  // ── Scenario 8: the auditor walks away with proof ───────────────────
+  section("Scenario 8 — audit export: filtered CSV + self-verifying bundle");
+  {
+    const today = new Date().toISOString().slice(0, 10);
+    const csv = await adminGetText(
+      `/api/admin/orgs/${orgId}/export/purchases.csv?from=${today}&agent=res-1`
+    );
+    const rows = csv.trim().split("\n").slice(1);
+    check(
+      rows.length === 4 && rows.every((r) => r.includes("res-1")),
+      "purchases.csv?agent=res-1 returns exactly res-1's 4 requests",
+      `got ${rows.length} rows`
+    );
+
+    const bundle = JSON.parse(
+      await adminGetText(`/api/admin/orgs/${orgId}/export/audit-bundle.json`)
+    ) as VerifiableBundle & { verification: { ok: boolean } };
+    check(
+      bundle.verification.ok === true,
+      "the bundle's embedded chain verification passes"
+    );
+    const independent = await verifyBundle(bundle);
+    check(
+      independent.ok && independent.count === bundle.events.length,
+      `independent re-verification confirms all ${independent.count} events`
+    );
+
+    const tampered = structuredClone(bundle);
+    tampered.events[2].payload_json = tampered.events[2].payload_json.replace(
+      /\d/,
+      "9"
+    );
+    const caught = await verifyBundle(tampered);
+    check(
+      !caught.ok && caught.brokenAtSeq === tampered.events[2].seq,
+      "tampering with one event is caught at the exact sequence number"
+    );
+  }
+
   // ── Wrap up ─────────────────────────────────────────────────────────
   section("Result");
   console.log(`  ${passed} checks passed, ${failed} failed`);
   console.log(
     `\nDemo org ${orgId} is live: frozen agents (loop-agent, injected-agent), an` +
-      `\noverbilled InferenceCloud invoice, and one pending $150 approval.` +
+      `\noverbilled InferenceCloud invoice, a research team that exhausted its shared` +
+      `\nbudget, three pending approvals (one routed to lead@sim.test), and a` +
+      `\nverified audit bundle.` +
       (APPROVER
         ? `\nLog in at ${BASE_URL}/dashboard as ${APPROVER} to review it.`
         : `\nRe-run with --approver you@example.com to inspect it in the dashboard.`)
