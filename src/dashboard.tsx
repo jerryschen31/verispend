@@ -3,16 +3,25 @@ import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import type { Child } from "hono/jsx";
 import { decideRequestById } from "./approvals";
 import {
+  MEMBER_ROLES,
+  countAdmins,
   createAgentKey,
+  deleteMember,
   getActivePolicy,
+  getFirstMembershipByEmail,
+  getMemberById,
+  getMembership,
   getOrg,
   getOrgByApproverEmail,
   insertPolicy,
   listAgentKeys,
   listBilledCharges,
+  listMembers,
   listPurchaseRequests,
   listUsageRecords,
   revokeAgentKey,
+  upsertMember,
+  type MemberRole,
   type PurchaseRequestRow,
   type RequestStatus,
 } from "./db";
@@ -34,7 +43,7 @@ import {
   logoutUrl,
 } from "./kinde";
 
-type Vars = { orgId: string; email: string };
+type Vars = { orgId: string; email: string; role: MemberRole };
 
 export const dashboard = new Hono<{ Bindings: Env; Variables: Vars }>();
 
@@ -83,6 +92,7 @@ const Layout = (props: { title: string; orgName?: string; children: Child }) => 
         <a href="/dashboard/reconciliation">Reconciliation</a>
         <a href="/dashboard/policy">Policy</a>
         <a href="/dashboard/keys">Agent Keys</a>
+        <a href="/dashboard/members">Members</a>
         <a href="/dashboard/audit">Audit</a>
         <span style="flex:1" />
         {props.orgName && <span class="muted">{props.orgName}</span>}
@@ -203,14 +213,27 @@ dashboard.get("/auth/callback", async (c) => {
     return c.text("Sign-in failed. Please try again.", 401);
   }
 
-  const org = await getOrgByApproverEmail(c.env.DB, result.email);
-  if (!org) {
+  let membership = await getFirstMembershipByEmail(c.env.DB, result.email);
+  if (!membership) {
+    // One-release safety net for orgs created between code deploy and the
+    // 0004 migration seed: promote a legacy approver_email to admin member.
+    const legacyOrg = await getOrgByApproverEmail(c.env.DB, result.email);
+    if (legacyOrg) {
+      await upsertMember(c.env.DB, {
+        orgId: legacyOrg.id,
+        email: result.email,
+        role: "admin",
+      });
+      membership = await getMembership(c.env.DB, legacyOrg.id, result.email);
+    }
+  }
+  if (!membership) {
     return c.html(
       <body style="font-family:system-ui;max-width:28rem;margin:5rem auto">
         <h1>No org for this account</h1>
         <p>
           You signed in as <strong>{result.email}</strong>, but that address is
-          not an approver for any VeriSpend org.
+          not a member of any VeriSpend org.
         </p>
         <a href={logoutUrl(c.env)}>Sign in with a different account</a>
       </body>,
@@ -220,8 +243,8 @@ dashboard.get("/auth/callback", async (c) => {
 
   const session = await signToken(c.env.SESSION_SECRET, {
     purpose: "session",
-    email: result.email,
-    orgId: org.id,
+    email: membership.email,
+    orgId: membership.org_id,
     exp: Date.now() + SESSION_TTL_MS,
   });
   setCookie(c, SESSION_COOKIE, session, {
@@ -250,12 +273,44 @@ const requireSession: MiddlewareHandler<{
     ? await verifyToken(c.env.SESSION_SECRET, cookie, "session")
     : null;
   if (!payload) return c.redirect("/login");
+  // Role is looked up per request (not stored in the token) so removing or
+  // downgrading a member takes effect immediately.
+  const membership = await getMembership(c.env.DB, payload.orgId, payload.email);
+  if (!membership) {
+    deleteCookie(c, SESSION_COOKIE, { path: "/" });
+    return c.redirect("/login");
+  }
   c.set("orgId", payload.orgId);
   c.set("email", payload.email);
+  c.set("role", membership.role);
   await next();
 };
 dashboard.use("/dashboard", requireSession);
 dashboard.use("/dashboard/*", requireSession);
+
+const requireRole =
+  (...roles: MemberRole[]): MiddlewareHandler<{ Bindings: Env; Variables: Vars }> =>
+  async (c, next) => {
+    if (!roles.includes(c.get("role"))) {
+      return c.text(`Forbidden: requires ${roles.join(" or ")} role.`, 403);
+    }
+    await next();
+  };
+const adminOnly = requireRole("admin");
+const canDecide = requireRole("admin", "approver");
+
+dashboard.use("/dashboard/decide", canDecide);
+dashboard.use("/dashboard/bills", canDecide);
+dashboard.use("/dashboard/policy", async (c, next) =>
+  c.req.method === "POST" ? adminOnly(c, next) : next()
+);
+dashboard.use("/dashboard/keys/create", adminOnly);
+dashboard.use("/dashboard/keys/revoke", adminOnly);
+dashboard.use("/dashboard/agents/unfreeze", adminOnly);
+dashboard.use("/dashboard/members", async (c, next) =>
+  c.req.method === "POST" ? adminOnly(c, next) : next()
+);
+dashboard.use("/dashboard/members/delete", adminOnly);
 
 // ---------- Views ----------
 
@@ -292,7 +347,7 @@ dashboard.get("/dashboard", async (c) => {
       {pending.length === 0 ? (
         <p class="muted">Nothing waiting on you.</p>
       ) : (
-        <RequestTable rows={pending} actions />
+        <RequestTable rows={pending} actions={c.get("role") !== "viewer"} />
       )}
       <h2>Recent activity</h2>
       <RequestTable rows={recent} />
@@ -518,12 +573,16 @@ dashboard.get("/dashboard/policy", async (c) => {
         they were evaluated under. Amounts are integer cents.
       </p>
       <form method="post" action="/dashboard/policy">
-        <textarea name="rules" rows={18}>
+        <textarea name="rules" rows={18} readonly={c.get("role") !== "admin"}>
           {JSON.stringify(policy?.rules ?? {}, null, 2)}
         </textarea>
-        <button class="btn" style="background:#0f172a;margin-top:0.6rem">
-          Save new version
-        </button>
+        {c.get("role") === "admin" ? (
+          <button class="btn" style="background:#0f172a;margin-top:0.6rem">
+            Save new version
+          </button>
+        ) : (
+          <p class="muted">Only admins can edit the policy.</p>
+        )}
       </form>
     </Layout>
   );
@@ -582,10 +641,12 @@ dashboard.get("/dashboard/keys", async (c) => {
                 <td>{f.signal.replaceAll("_", " ")}</td>
                 <td class="muted">{f.reason}</td>
                 <td>
-                  <form method="post" action="/dashboard/agents/unfreeze">
-                    <input type="hidden" name="agent_id" value={f.agent_id} />
-                    <button class="btn" style="background:#16a34a">Unfreeze</button>
-                  </form>
+                  {c.get("role") === "admin" && (
+                    <form method="post" action="/dashboard/agents/unfreeze">
+                      <input type="hidden" name="agent_id" value={f.agent_id} />
+                      <button class="btn" style="background:#16a34a">Unfreeze</button>
+                    </form>
+                  )}
                 </td>
               </tr>
             ))}
@@ -593,10 +654,12 @@ dashboard.get("/dashboard/keys", async (c) => {
         </>
       )}
       <h2>Agent API keys</h2>
-      <form method="post" action="/dashboard/keys/create" style="display:flex;gap:0.5rem;margin-bottom:1rem">
-        <input name="agent_id" placeholder="Agent id, e.g. travel-agent" required />
-        <button class="btn" style="background:#0f172a">Create key</button>
-      </form>
+      {c.get("role") === "admin" && (
+        <form method="post" action="/dashboard/keys/create" style="display:flex;gap:0.5rem;margin-bottom:1rem">
+          <input name="agent_id" placeholder="Agent id, e.g. travel-agent" required />
+          <button class="btn" style="background:#0f172a">Create key</button>
+        </form>
+      )}
       <table>
         <tr>
           <th>Agent</th>
@@ -610,7 +673,7 @@ dashboard.get("/dashboard/keys", async (c) => {
             <td>{k.created_at.slice(0, 16).replace("T", " ")}</td>
             <td>{k.revoked_at ? <span class="muted">revoked</span> : "active"}</td>
             <td>
-              {!k.revoked_at && (
+              {!k.revoked_at && c.get("role") === "admin" && (
                 <form method="post" action="/dashboard/keys/revoke">
                   <input type="hidden" name="key_id" value={k.id} />
                   <button class="btn" style="background:#dc2626">Revoke</button>
@@ -674,6 +737,106 @@ dashboard.post("/dashboard/keys/revoke", async (c) => {
   const form = await c.req.formData();
   await revokeAgentKey(c.env.DB, c.get("orgId"), String(form.get("key_id") ?? ""));
   return c.redirect("/dashboard/keys");
+});
+
+dashboard.get("/dashboard/members", async (c) => {
+  const orgId = c.get("orgId");
+  const org = await getOrg(c.env.DB, orgId);
+  const members = await listMembers(c.env.DB, orgId);
+  const isAdmin = c.get("role") === "admin";
+  const error = c.req.query("error");
+  return c.html(
+    <Layout title="Members" orgName={org?.name}>
+      <h2>Members</h2>
+      <p class="muted">
+        Admins manage policy, keys, teams, and members. Approvers decide
+        pending purchases. Viewers have read-only access.
+      </p>
+      {error && <p style="color:#dc2626">{error}</p>}
+      {isAdmin && (
+        <form method="post" action="/dashboard/members" style="display:flex;gap:0.5rem;margin-bottom:1rem">
+          <input name="email" type="email" placeholder="person@company.com" required />
+          <select name="role">
+            {MEMBER_ROLES.map((r) => (
+              <option value={r}>{r}</option>
+            ))}
+          </select>
+          <button class="btn" style="background:#0f172a">Add member</button>
+        </form>
+      )}
+      <table>
+        <tr>
+          <th>Email</th>
+          <th>Role</th>
+          <th>Added (UTC)</th>
+          {isAdmin && <th />}
+        </tr>
+        {members.map((m) => (
+          <tr>
+            <td>{m.email}</td>
+            <td>
+              {isAdmin ? (
+                <form method="post" action="/dashboard/members" style="display:flex;gap:0.4rem">
+                  <input type="hidden" name="email" value={m.email} />
+                  <select name="role">
+                    {MEMBER_ROLES.map((r) => (
+                      <option value={r} selected={r === m.role}>
+                        {r}
+                      </option>
+                    ))}
+                  </select>
+                  <button class="btn" style="background:#0f172a">Set</button>
+                </form>
+              ) : (
+                m.role
+              )}
+            </td>
+            <td>{m.created_at.slice(0, 16).replace("T", " ")}</td>
+            {isAdmin && (
+              <td>
+                <form method="post" action="/dashboard/members/delete">
+                  <input type="hidden" name="member_id" value={m.id} />
+                  <button class="btn" style="background:#dc2626">Remove</button>
+                </form>
+              </td>
+            )}
+          </tr>
+        ))}
+      </table>
+    </Layout>
+  );
+});
+
+dashboard.post("/dashboard/members", async (c) => {
+  const orgId = c.get("orgId");
+  const form = await c.req.formData();
+  const email = String(form.get("email") ?? "").trim();
+  const role = String(form.get("role") ?? "") as MemberRole;
+  if (!email || !MEMBER_ROLES.includes(role)) {
+    return c.text("email and a valid role are required", 400);
+  }
+  // Demoting the last admin would lock everyone out of member management.
+  const existing = await getMembership(c.env.DB, orgId, email);
+  if (existing?.role === "admin" && role !== "admin") {
+    if ((await countAdmins(c.env.DB, orgId)) <= 1) {
+      return c.text("Cannot demote the last admin.", 400);
+    }
+  }
+  await upsertMember(c.env.DB, { orgId, email, role });
+  return c.redirect("/dashboard/members");
+});
+
+dashboard.post("/dashboard/members/delete", async (c) => {
+  const orgId = c.get("orgId");
+  const form = await c.req.formData();
+  const memberId = String(form.get("member_id") ?? "");
+  const member = await getMemberById(c.env.DB, orgId, memberId);
+  if (!member) return c.redirect("/dashboard/members");
+  if (member.role === "admin" && (await countAdmins(c.env.DB, orgId)) <= 1) {
+    return c.text("Cannot remove the last admin.", 400);
+  }
+  await deleteMember(c.env.DB, orgId, memberId);
+  return c.redirect("/dashboard/members");
 });
 
 dashboard.get("/dashboard/audit", async (c) => {

@@ -2,7 +2,15 @@ import { Hono } from "hono";
 import { decideRequest } from "./approvals";
 import { dashboard } from "./dashboard";
 import { authenticateApiKey, bearerToken, timingSafeEqualStr } from "./auth";
-import { createAgentKey, createOrg, getOrg, insertPolicy } from "./db";
+import {
+  MEMBER_ROLES,
+  createAgentKey,
+  createOrg,
+  getOrg,
+  insertPolicy,
+  upsertMember,
+  type MemberRole,
+} from "./db";
 import { ingestBill } from "./reconcile";
 import { DEFAULT_POLICY, type PolicyRules } from "./policy";
 import { VeriSpendMCP } from "./mcp";
@@ -54,6 +62,7 @@ app.post("/api/admin/orgs", async (c) => {
     approver_email?: string;
     agent_id?: string;
     policy?: PolicyRules;
+    members?: Array<{ email?: string; role?: MemberRole }>;
   }>();
   if (!body.name || !body.agent_id) {
     return c.json({ error: "name and agent_id are required" }, 400);
@@ -63,6 +72,15 @@ app.post("/api/admin/orgs", async (c) => {
     name: body.name,
     approverEmail: body.approver_email,
   });
+  for (const member of body.members ?? []) {
+    if (member.email && member.role && MEMBER_ROLES.includes(member.role)) {
+      await upsertMember(c.env.DB, {
+        orgId,
+        email: member.email,
+        role: member.role,
+      });
+    }
+  }
   const { version } = await insertPolicy(c.env.DB, {
     orgId,
     rules: body.policy ?? DEFAULT_POLICY,
@@ -97,6 +115,28 @@ app.post("/api/admin/orgs/:orgId/keys", async (c) => {
     agentId: body.agent_id,
   });
   return c.json({ agent_id: body.agent_id, api_key: apiKey });
+});
+
+// Member management for API-driven workflows (and the agent simulator). The
+// dashboard's members page is the session-guarded equivalent.
+app.post("/api/admin/orgs/:orgId/members", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  if (!(await getOrg(c.env.DB, orgId))) {
+    return c.json({ error: "no such org" }, 404);
+  }
+  const body = await c.req.json<{ email?: string; role?: MemberRole }>();
+  if (!body.email || !body.role || !MEMBER_ROLES.includes(body.role)) {
+    return c.json({ error: "email and a valid role are required" }, 400);
+  }
+  const { id } = await upsertMember(c.env.DB, {
+    orgId,
+    email: body.email,
+    role: body.role,
+  });
+  return c.json({ member_id: id, email: body.email.trim().toLowerCase(), role: body.role });
 });
 
 // Bill ingestion for API-driven workflows (and the agent simulator). The

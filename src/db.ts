@@ -39,7 +39,113 @@ export async function createOrg(
     .prepare("INSERT INTO orgs (id, name, approver_email) VALUES (?, ?, ?)")
     .bind(orgId, args.name, args.approverEmail ?? null)
     .run();
+  if (args.approverEmail?.trim()) {
+    await upsertMember(db, { orgId, email: args.approverEmail, role: "admin" });
+  }
   return { orgId };
+}
+
+// ---------- Org members (humans with dashboard roles) ----------
+
+export type MemberRole = "admin" | "approver" | "viewer";
+
+export const MEMBER_ROLES: readonly MemberRole[] = ["admin", "approver", "viewer"];
+
+export type OrgMemberRow = {
+  id: string;
+  org_id: string;
+  email: string;
+  role: MemberRole;
+  created_at: string;
+};
+
+/** Emails are stored and matched as lower(trim()); Kinde may mix case. */
+const normEmail = (email: string) => email.trim().toLowerCase();
+
+export async function listMembers(
+  db: D1Database,
+  orgId: string
+): Promise<OrgMemberRow[]> {
+  const { results } = await db
+    .prepare(
+      "SELECT * FROM org_members WHERE org_id = ? ORDER BY created_at, email"
+    )
+    .bind(orgId)
+    .all<OrgMemberRow>();
+  return results;
+}
+
+export async function getMembership(
+  db: D1Database,
+  orgId: string,
+  email: string
+): Promise<OrgMemberRow | null> {
+  return db
+    .prepare("SELECT * FROM org_members WHERE org_id = ? AND email = ?")
+    .bind(orgId, normEmail(email))
+    .first<OrgMemberRow>();
+}
+
+/** First membership for an email across orgs (oldest org wins, like the
+ * legacy approver_email lookup). TODO: org picker for multi-org emails. */
+export async function getFirstMembershipByEmail(
+  db: D1Database,
+  email: string
+): Promise<OrgMemberRow | null> {
+  return db
+    .prepare(
+      "SELECT * FROM org_members WHERE email = ? ORDER BY created_at, org_id LIMIT 1"
+    )
+    .bind(normEmail(email))
+    .first<OrgMemberRow>();
+}
+
+export async function upsertMember(
+  db: D1Database,
+  args: { orgId: string; email: string; role: MemberRole }
+): Promise<{ id: string }> {
+  const id = `mem_${crypto.randomUUID()}`;
+  await db
+    .prepare(
+      `INSERT INTO org_members (id, org_id, email, role) VALUES (?, ?, ?, ?)
+       ON CONFLICT (org_id, email) DO UPDATE SET role = excluded.role`
+    )
+    .bind(id, args.orgId, normEmail(args.email), args.role)
+    .run();
+  const row = await getMembership(db, args.orgId, args.email);
+  return { id: row?.id ?? id };
+}
+
+export async function deleteMember(
+  db: D1Database,
+  orgId: string,
+  memberId: string
+): Promise<void> {
+  await db
+    .prepare("DELETE FROM org_members WHERE org_id = ? AND id = ?")
+    .bind(orgId, memberId)
+    .run();
+}
+
+export async function countAdmins(db: D1Database, orgId: string): Promise<number> {
+  const row = await db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM org_members WHERE org_id = ? AND role = 'admin'"
+    )
+    .bind(orgId)
+    .first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
+export async function getMemberById(
+  db: D1Database,
+  orgId: string,
+  memberId: string
+): Promise<OrgMemberRow | null> {
+  return db
+    .prepare("SELECT * FROM org_members WHERE org_id = ? AND id = ?")
+    .bind(orgId, memberId)
+    .first<OrgMemberRow>();
 }
 
 export async function getOrg(
