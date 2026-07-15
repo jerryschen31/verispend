@@ -485,6 +485,30 @@ export async function getRequestByDecisionToken(
     .first<PurchaseRequestRow>();
 }
 
+export async function insertDecisionToken(
+  db: D1Database,
+  args: { token: string; orgId: string; requestId: string; recipientEmail: string }
+): Promise<void> {
+  await db
+    .prepare(
+      "INSERT INTO decision_tokens (token, org_id, request_id, recipient_email) VALUES (?, ?, ?, ?)"
+    )
+    .bind(args.token, args.orgId, args.requestId, args.recipientEmail)
+    .run();
+}
+
+export async function getDecisionToken(
+  db: D1Database,
+  token: string
+): Promise<{ org_id: string; request_id: string; recipient_email: string } | null> {
+  return db
+    .prepare(
+      "SELECT org_id, request_id, recipient_email FROM decision_tokens WHERE token = ?"
+    )
+    .bind(token)
+    .first();
+}
+
 export async function applyHumanDecision(
   db: D1Database,
   args: {

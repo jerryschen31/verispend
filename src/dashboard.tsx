@@ -380,7 +380,10 @@ dashboard.post("/dashboard/decide", async (c) => {
   const requestId = String(form.get("request_id") ?? "");
   const action = String(form.get("action") ?? "");
   if (action === "approve" || action === "deny") {
-    await decideRequestById(c.env, c.get("orgId"), requestId, action);
+    await decideRequestById(c.env, c.get("orgId"), requestId, action, {
+      approver: c.get("email"),
+      via: "dashboard",
+    });
   }
   return c.redirect("/dashboard");
 });

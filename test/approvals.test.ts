@@ -78,11 +78,11 @@ async function escalatedRequest(amountCents: number): Promise<{
   });
   expect(result.status).toBe("pending_approval");
   const row = await env.DB.prepare(
-    "SELECT decision_token FROM purchase_requests WHERE id = ?"
+    "SELECT token FROM decision_tokens WHERE request_id = ?"
   )
     .bind(result.request_id)
-    .first<{ decision_token: string }>();
-  return { requestId: result.request_id, token: row!.decision_token };
+    .first<{ token: string }>();
+  return { requestId: result.request_id, token: row!.token };
 }
 
 beforeAll(async () => {

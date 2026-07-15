@@ -2,7 +2,7 @@
 // what the provider billed. Reconciliation runs once, at bill ingest, and the
 // verdict is stored on the bill row and the ledger.
 
-import { sendReconciliationAlertEmail } from "./approvals";
+import { resolveApprovers, sendReconciliationAlertEmail } from "./approvals";
 import {
   getActivePolicy,
   getOrg,
@@ -133,10 +133,12 @@ export async function ingestBill(
 
   if (status !== "ok") {
     const org = await getOrg(env.DB, args.orgId);
-    if (org?.approver_email) {
+    // Bills have no agent context, so this resolves to org-wide recipients.
+    const alertTo = await resolveApprovers(env.DB, args.orgId, null);
+    for (const email of alertTo.emails) {
       await sendReconciliationAlertEmail(env, {
-        approverEmail: org.approver_email,
-        orgName: org.name,
+        approverEmail: email,
+        orgName: org?.name ?? "your org",
         vendor: args.vendor,
         periodStart: args.periodStart,
         periodEnd: args.periodEnd,

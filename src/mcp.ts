@@ -6,12 +6,17 @@ import {
   getOrg,
   getPurchaseRequest,
   getTeamForAgent,
+  insertDecisionToken,
   insertPurchaseRequest,
   insertUsageRecord,
   markOutcomeRecorded,
   type TeamRow,
 } from "./db";
-import { sendApprovalEmail, sendBreakerAlertEmail } from "./approvals";
+import {
+  resolveApprovers,
+  sendApprovalEmail,
+  sendBreakerAlertEmail,
+} from "./approvals";
 import {
   evaluatePolicy,
   resolveAgentLimits,
@@ -209,7 +214,6 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
         const approvalRef =
           decision.decision === "approved" ? `apr_${crypto.randomUUID()}` : null;
         const decidedNow = decision.decision !== "pending_approval";
-        const decisionToken = decidedNow ? null : `dt_${crypto.randomUUID()}`;
 
         await insertPurchaseRequest(db, {
           id: requestId,
@@ -226,15 +230,24 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           denial_reason: decision.decision === "denied" ? decision.reason : null,
           approval_ref: approvalRef,
           decided_at: decidedNow ? new Date().toISOString() : null,
-          decision_token: decisionToken,
+          decision_token: null, // per-recipient tokens live in decision_tokens
         });
 
-        if (decisionToken) {
+        let routed: { emails: string[]; source: string } | null = null;
+        if (!decidedNow) {
+          routed = await resolveApprovers(db, orgId, agentId);
           const orgRow = await getOrg(db, orgId);
-          if (orgRow?.approver_email) {
+          for (const email of routed.emails) {
+            const token = `dt_${crypto.randomUUID()}`;
+            await insertDecisionToken(db, {
+              token,
+              orgId,
+              requestId,
+              recipientEmail: email,
+            });
             await sendApprovalEmail(this.env, {
-              approverEmail: orgRow.approver_email,
-              orgName: orgRow.name,
+              approverEmail: email,
+              orgName: orgRow?.name ?? "your org",
               row: {
                 agent_id: agentId,
                 vendor,
@@ -243,7 +256,7 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
                 category,
                 justification,
               },
-              decisionToken,
+              decisionToken: token,
             });
           }
         }
@@ -267,6 +280,14 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
             trace: decision.trace,
           },
         });
+        if (routed) {
+          await org().appendEvent({
+            orgId,
+            requestId,
+            eventType: "approval_routed",
+            payload: { recipients: routed.emails, source: routed.source },
+          });
+        }
 
         if (breaker.status === "tripped") {
           await org().appendEvent({
@@ -281,10 +302,11 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
             },
           });
           const orgRow = await getOrg(db, orgId);
-          if (orgRow?.approver_email) {
+          const alertTo = await resolveApprovers(db, orgId, agentId);
+          for (const email of alertTo.emails) {
             await sendBreakerAlertEmail(this.env, {
-              approverEmail: orgRow.approver_email,
-              orgName: orgRow.name,
+              approverEmail: email,
+              orgName: orgRow?.name ?? "your org",
               agentId,
               signal: breaker.signal,
               reason: breaker.reason,
