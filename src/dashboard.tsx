@@ -14,17 +14,26 @@ import {
   getOrg,
   getOrgByApproverEmail,
   insertPolicy,
+  createTeam,
+  getTeam,
   listAgentKeys,
   listBilledCharges,
+  listKnownAgentIds,
   listMembers,
   listPurchaseRequests,
+  listTeamAgents,
+  listTeamApprovers,
+  listTeams,
   listUsageRecords,
   revokeAgentKey,
+  setAgentTeam,
+  setTeamApprover,
   upsertMember,
   type MemberRole,
   type PurchaseRequestRow,
   type RequestStatus,
 } from "./db";
+import { resolveTeamLimits } from "./policy";
 import { ingestBill } from "./reconcile";
 import { verifyLedgerChain } from "./ledger";
 import type { FrozenAgentRow } from "./org-do";
@@ -92,6 +101,7 @@ const Layout = (props: { title: string; orgName?: string; children: Child }) => 
         <a href="/dashboard/reconciliation">Reconciliation</a>
         <a href="/dashboard/policy">Policy</a>
         <a href="/dashboard/keys">Agent Keys</a>
+        <a href="/dashboard/teams">Teams</a>
         <a href="/dashboard/members">Members</a>
         <a href="/dashboard/audit">Audit</a>
         <span style="flex:1" />
@@ -307,10 +317,14 @@ dashboard.use("/dashboard/policy", async (c, next) =>
 dashboard.use("/dashboard/keys/create", adminOnly);
 dashboard.use("/dashboard/keys/revoke", adminOnly);
 dashboard.use("/dashboard/agents/unfreeze", adminOnly);
-dashboard.use("/dashboard/members", async (c, next) =>
-  c.req.method === "POST" ? adminOnly(c, next) : next()
-);
+const adminPosts: MiddlewareHandler<{ Bindings: Env; Variables: Vars }> = (
+  c,
+  next
+) => (c.req.method === "POST" ? adminOnly(c, next) : next());
+dashboard.use("/dashboard/members", adminPosts);
 dashboard.use("/dashboard/members/delete", adminOnly);
+dashboard.use("/dashboard/teams", adminPosts);
+dashboard.use("/dashboard/teams/*", adminPosts);
 
 // ---------- Views ----------
 
@@ -737,6 +751,257 @@ dashboard.post("/dashboard/keys/revoke", async (c) => {
   const form = await c.req.formData();
   await revokeAgentKey(c.env.DB, c.get("orgId"), String(form.get("key_id") ?? ""));
   return c.redirect("/dashboard/keys");
+});
+
+// ---------- Teams ----------
+
+dashboard.get("/dashboard/teams", async (c) => {
+  const orgId = c.get("orgId");
+  const org = await getOrg(c.env.DB, orgId);
+  const teams = await listTeams(c.env.DB, orgId);
+  const policy = await getActivePolicy(c.env.DB, orgId);
+  const isAdmin = c.get("role") === "admin";
+  return c.html(
+    <Layout title="Teams" orgName={org?.name}>
+      <h2>Teams</h2>
+      <p class="muted">
+        A team's agents share one budget, and its approvers receive the team's
+        approval requests. Team budgets live in the spend policy under{" "}
+        <code>budgets.teams</code>.
+      </p>
+      {isAdmin && (
+        <form method="post" action="/dashboard/teams" style="display:flex;gap:0.5rem;margin-bottom:1rem">
+          <input name="name" placeholder="Team name, e.g. research" required />
+          <button class="btn" style="background:#0f172a">Create team</button>
+        </form>
+      )}
+      <table>
+        <tr>
+          <th>Team</th>
+          <th>Agents</th>
+          <th>Daily budget</th>
+          <th>Monthly budget</th>
+        </tr>
+        {teams.map((t) => {
+          const limits = policy ? resolveTeamLimits(policy.rules, t.id) : undefined;
+          return (
+            <tr>
+              <td>
+                <a href={`/dashboard/teams/${t.id}`}>{t.name}</a>
+              </td>
+              <td>{t.agent_count}</td>
+              <td>{limits?.dailyCents !== undefined ? fmt(limits.dailyCents, policy?.rules.currency) : <span class="muted">—</span>}</td>
+              <td>{limits?.monthlyCents !== undefined ? fmt(limits.monthlyCents, policy?.rules.currency) : <span class="muted">—</span>}</td>
+            </tr>
+          );
+        })}
+      </table>
+    </Layout>
+  );
+});
+
+dashboard.post("/dashboard/teams", async (c) => {
+  const form = await c.req.formData();
+  const name = String(form.get("name") ?? "").trim();
+  if (!name) return c.text("name is required", 400);
+  const { teamId } = await createTeam(c.env.DB, { orgId: c.get("orgId"), name });
+  return c.redirect(`/dashboard/teams/${teamId}`);
+});
+
+dashboard.get("/dashboard/teams/:teamId", async (c) => {
+  const orgId = c.get("orgId");
+  const team = await getTeam(c.env.DB, orgId, c.req.param("teamId"));
+  if (!team) return c.text("No such team", 404);
+  const org = await getOrg(c.env.DB, orgId);
+  const policy = await getActivePolicy(c.env.DB, orgId);
+  const limits = policy ? resolveTeamLimits(policy.rules, team.id) : undefined;
+  const agents = await listTeamAgents(c.env.DB, team.id);
+  const approvers = await listTeamApprovers(c.env.DB, team.id);
+  const approverIds = new Set(approvers.map((a) => a.id));
+  const members = (await listMembers(c.env.DB, orgId)).filter(
+    (m) => m.role !== "viewer"
+  );
+  const knownAgents = await listKnownAgentIds(c.env.DB, orgId);
+  const isAdmin = c.get("role") === "admin";
+  return c.html(
+    <Layout title={`Team ${team.name}`} orgName={org?.name}>
+      <h2>Team: {team.name}</h2>
+
+      <h3>Agents</h3>
+      <p class="muted">
+        Each agent belongs to at most one team. Reassigning an agent moves its
+        future spend to the new team; spend already counted stays where it was.
+      </p>
+      {agents.length === 0 ? (
+        <p class="muted">No agents assigned.</p>
+      ) : (
+        <table style="margin-bottom:0.8rem">
+          {agents.map((a) => (
+            <tr>
+              <td>
+                <code>{a}</code>
+              </td>
+              <td>
+                {isAdmin && (
+                  <form method="post" action={`/dashboard/teams/${team.id}/agents`}>
+                    <input type="hidden" name="agent_id" value={a} />
+                    <input type="hidden" name="action" value="remove" />
+                    <button class="btn" style="background:#dc2626">Remove</button>
+                  </form>
+                )}
+              </td>
+            </tr>
+          ))}
+        </table>
+      )}
+      {isAdmin && (
+        <form method="post" action={`/dashboard/teams/${team.id}/agents`} style="display:flex;gap:0.5rem;margin-bottom:1.5rem">
+          <input name="agent_id" list="known-agents" placeholder="Agent id" required />
+          <datalist id="known-agents">
+            {knownAgents.map((a) => (
+              <option value={a} />
+            ))}
+          </datalist>
+          <input type="hidden" name="action" value="add" />
+          <button class="btn" style="background:#0f172a">Assign agent</button>
+        </form>
+      )}
+
+      <h3>Approvers</h3>
+      <p class="muted">
+        These members get this team's approval emails. With none set, requests
+        route to all org admins and approvers.
+      </p>
+      {isAdmin ? (
+        <form method="post" action={`/dashboard/teams/${team.id}/approvers`} style="margin-bottom:1.5rem">
+          {members.map((m) => (
+            <label style="display:block;margin-bottom:0.3rem">
+              <input
+                type="checkbox"
+                name="member_id"
+                value={m.id}
+                checked={approverIds.has(m.id)}
+              />{" "}
+              {m.email} <span class="muted">({m.role})</span>
+            </label>
+          ))}
+          <button class="btn" style="background:#0f172a">Save approvers</button>
+        </form>
+      ) : (
+        <p style="margin-bottom:1.5rem">
+          {approvers.length === 0 ? (
+            <span class="muted">None (org-wide routing)</span>
+          ) : (
+            approvers.map((a) => a.email).join(", ")
+          )}
+        </p>
+      )}
+
+      <h3>Shared budget</h3>
+      <p class="muted">
+        Saving writes a new policy version with{" "}
+        <code>budgets.teams["{team.id}"]</code>. Blank means no limit.
+      </p>
+      {isAdmin ? (
+        <form method="post" action={`/dashboard/teams/${team.id}/budget`} style="display:flex;gap:0.5rem">
+          <input
+            name="daily_cents"
+            type="number"
+            min="0"
+            placeholder="Daily (cents)"
+            value={limits?.dailyCents !== undefined ? String(limits.dailyCents) : ""}
+          />
+          <input
+            name="monthly_cents"
+            type="number"
+            min="0"
+            placeholder="Monthly (cents)"
+            value={limits?.monthlyCents !== undefined ? String(limits.monthlyCents) : ""}
+          />
+          <button class="btn" style="background:#0f172a">Save budget</button>
+        </form>
+      ) : (
+        <p>
+          daily: {limits?.dailyCents !== undefined ? fmt(limits.dailyCents, policy?.rules.currency) : "—"}, monthly:{" "}
+          {limits?.monthlyCents !== undefined ? fmt(limits.monthlyCents, policy?.rules.currency) : "—"}
+        </p>
+      )}
+    </Layout>
+  );
+});
+
+dashboard.post("/dashboard/teams/:teamId/agents", async (c) => {
+  const orgId = c.get("orgId");
+  const team = await getTeam(c.env.DB, orgId, c.req.param("teamId"));
+  if (!team) return c.text("No such team", 404);
+  const form = await c.req.formData();
+  const agentId = String(form.get("agent_id") ?? "").trim();
+  if (!agentId) return c.text("agent_id is required", 400);
+  await setAgentTeam(c.env.DB, {
+    orgId,
+    agentId,
+    teamId: form.get("action") === "remove" ? null : team.id,
+  });
+  return c.redirect(`/dashboard/teams/${team.id}`);
+});
+
+dashboard.post("/dashboard/teams/:teamId/approvers", async (c) => {
+  const orgId = c.get("orgId");
+  const team = await getTeam(c.env.DB, orgId, c.req.param("teamId"));
+  if (!team) return c.text("No such team", 404);
+  const form = await c.req.formData();
+  const selected = new Set(form.getAll("member_id").map(String));
+  // Only non-viewer members of this org may be team approvers.
+  const eligible = (await listMembers(c.env.DB, orgId)).filter(
+    (m) => m.role !== "viewer"
+  );
+  for (const member of eligible) {
+    await setTeamApprover(c.env.DB, {
+      teamId: team.id,
+      memberId: member.id,
+      on: selected.has(member.id),
+    });
+  }
+  return c.redirect(`/dashboard/teams/${team.id}`);
+});
+
+dashboard.post("/dashboard/teams/:teamId/budget", async (c) => {
+  const orgId = c.get("orgId");
+  const team = await getTeam(c.env.DB, orgId, c.req.param("teamId"));
+  if (!team) return c.text("No such team", 404);
+  const policy = await getActivePolicy(c.env.DB, orgId);
+  if (!policy) return c.text("No policy configured", 400);
+  const form = await c.req.formData();
+  const parse = (v: unknown) => {
+    const s = String(v ?? "").trim();
+    if (!s) return undefined;
+    const n = Number(s);
+    return Number.isInteger(n) && n >= 0 ? n : null;
+  };
+  const daily = parse(form.get("daily_cents"));
+  const monthly = parse(form.get("monthly_cents"));
+  if (daily === null || monthly === null) {
+    return c.text("Budgets must be non-negative integer cents.", 400);
+  }
+
+  const rules = { ...policy.rules };
+  rules.budgets = { ...rules.budgets, teams: { ...rules.budgets?.teams } };
+  if (daily === undefined && monthly === undefined) {
+    delete rules.budgets.teams![team.id];
+  } else {
+    rules.budgets.teams![team.id] = {
+      ...(daily !== undefined ? { dailyCents: daily } : {}),
+      ...(monthly !== undefined ? { monthlyCents: monthly } : {}),
+    };
+  }
+  const { version } = await insertPolicy(c.env.DB, { orgId, rules });
+  await c.env.ORG.getByName(orgId).appendEvent({
+    orgId,
+    requestId: "policy",
+    eventType: "policy_updated",
+    payload: { version, editedBy: c.get("email"), via: "teams_page", teamId: team.id },
+  });
+  return c.redirect(`/dashboard/teams/${team.id}`);
 });
 
 dashboard.get("/dashboard/members", async (c) => {

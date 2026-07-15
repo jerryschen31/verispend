@@ -39,12 +39,103 @@ describe("OrgCoordinator budgets", () => {
       orgLimits: { monthlyCents: 50_00 },
       nowIso: NOW,
     });
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       ok: false,
       exceeded: "org_monthly",
+      scope: "org",
+      period: "monthly",
       limitCents: 50_00,
       usedCents: 40_00,
     });
+  });
+
+  it("enforces a shared team budget across agents, atomically", async () => {
+    const stub = env.ORG.getByName("org-team-race");
+    const agents = ["a", "b", "c"];
+    const results = await Promise.all(
+      Array.from({ length: 10 }, (_, i) =>
+        stub.reserve({
+          agentId: agents[i % 3],
+          amountCents: 10_00,
+          teamId: "t1",
+          teamLimits: { dailyCents: 50_00 },
+          nowIso: NOW,
+        })
+      )
+    );
+    expect(results.filter((r) => r.ok)).toHaveLength(5); // 5 × $10 = the $50 cap
+
+    const usage = await stub.usage({ agentId: "a", teamId: "t1", nowIso: NOW });
+    expect(usage.teamDailyCents).toBe(50_00);
+  });
+
+  it("reports team scope details on a team-budget denial", async () => {
+    const stub = env.ORG.getByName("org-team-detail");
+    await stub.reserve({
+      agentId: "a",
+      amountCents: 40_00,
+      teamId: "t1",
+      teamLimits: { dailyCents: 50_00 },
+      agentLimits: { dailyCents: 100_00 },
+      nowIso: NOW,
+    });
+    const denied = await stub.reserve({
+      agentId: "b",
+      amountCents: 15_00,
+      teamId: "t1",
+      teamLimits: { dailyCents: 50_00 },
+      agentLimits: { dailyCents: 100_00 },
+      nowIso: NOW,
+    });
+    expect(denied).toMatchObject({
+      ok: false,
+      exceeded: "team_daily",
+      scope: "team",
+      scopeId: "t1",
+      period: "daily",
+      limitCents: 50_00,
+      usedCents: 40_00,
+    });
+    // The passing agent check comes along for explainability.
+    expect(denied.checks).toContainEqual({
+      scope: "agent",
+      scopeId: "b",
+      period: "daily",
+      limitCents: 100_00,
+      usedCents: 0,
+    });
+  });
+
+  it("trips the smaller agent cap before the team cap", async () => {
+    const stub = env.ORG.getByName("org-team-order");
+    const denied = await stub.reserve({
+      agentId: "a",
+      amountCents: 20_00,
+      agentLimits: { dailyCents: 10_00 },
+      teamId: "t1",
+      teamLimits: { dailyCents: 100_00 },
+      nowIso: NOW,
+    });
+    expect(denied).toMatchObject({ ok: false, exceeded: "agent_daily" });
+  });
+
+  it("adjust with a teamId corrects team counters; without leaves them", async () => {
+    const stub = env.ORG.getByName("org-team-adjust");
+    await stub.reserve({
+      agentId: "a",
+      amountCents: 30_00,
+      teamId: "t1",
+      nowIso: NOW,
+    });
+    await stub.adjust({ agentId: "a", deltaCents: -8_00, teamId: "t1", nowIso: NOW });
+    let usage = await stub.usage({ agentId: "a", teamId: "t1", nowIso: NOW });
+    expect(usage.teamDailyCents).toBe(22_00);
+
+    // Legacy call shape (no teamId) still works and leaves team counters alone.
+    await stub.adjust({ agentId: "a", deltaCents: -2_00, nowIso: NOW });
+    usage = await stub.usage({ agentId: "a", teamId: "t1", nowIso: NOW });
+    expect(usage.teamDailyCents).toBe(22_00);
+    expect(usage.agentDailyCents).toBe(20_00);
   });
 
   it("resets across day and month boundaries", async () => {

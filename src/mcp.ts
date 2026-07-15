@@ -5,9 +5,11 @@ import {
   getActivePolicy,
   getOrg,
   getPurchaseRequest,
+  getTeamForAgent,
   insertPurchaseRequest,
   insertUsageRecord,
   markOutcomeRecorded,
+  type TeamRow,
 } from "./db";
 import { sendApprovalEmail, sendBreakerAlertEmail } from "./approvals";
 import {
@@ -15,9 +17,20 @@ import {
   resolveAgentLimits,
   resolveBreakerRules,
   resolveOrgLimits,
+  resolveTeamLimits,
   type PurchaseIntent,
   type StaticDecision,
 } from "./policy";
+
+/** Human-readable name for the budget scope that rejected a reserve. */
+const scopeLabel = (
+  scope: "agent" | "team" | "org",
+  period: "daily" | "monthly",
+  team: TeamRow | null
+) =>
+  scope === "team"
+    ? `team "${team?.name ?? "unknown"}" ${period}`
+    : `${scope} ${period}`;
 
 // Set by the auth layer in index.ts before the request reaches the agent.
 export type Props = {
@@ -122,19 +135,22 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
         } else {
           decision = evaluatePolicy(policy.rules, intent);
         }
+        const team = await getTeamForAgent(db, orgId, agentId);
         if (decision.decision === "approved") {
           const reserve = await org().reserve({
             agentId,
             amountCents: amount_cents,
             orgLimits: resolveOrgLimits(policy.rules),
             agentLimits: resolveAgentLimits(policy.rules, agentId),
+            teamId: team?.id,
+            teamLimits: resolveTeamLimits(policy.rules, team?.id),
           });
           if (!reserve.ok) {
             decision = {
               decision: "denied",
               ruleFired: `budget_${reserve.exceeded}`,
               reason:
-                `Budget exceeded (${reserve.exceeded.replaceAll("_", " ")}): ` +
+                `Budget exceeded (${scopeLabel(reserve.scope, reserve.period, team)}): ` +
                 `${reserve.usedCents}¢ of ${reserve.limitCents}¢ already used; ` +
                 `this purchase of ${amount_cents}¢ does not fit.`,
             };
@@ -305,7 +321,8 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
 
         const deltaCents = final_amount_cents - row.amount_cents;
         if (deltaCents !== 0) {
-          await org().adjust({ agentId: row.agent_id, deltaCents });
+          const team = await getTeamForAgent(db, orgId, row.agent_id);
+          await org().adjust({ agentId: row.agent_id, deltaCents, teamId: team?.id });
         }
 
         const outcomeJson = receipt ? JSON.stringify({ receipt }) : null;
@@ -381,8 +398,9 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
 
         // Usage already happened, so it can't be blocked — but it consumes
         // budget headroom so future purchases and dashboards see it.
+        const team = await getTeamForAgent(db, orgId, agentId);
         if (expected_cost_cents > 0) {
-          await org().adjust({ agentId, deltaCents: expected_cost_cents });
+          await org().adjust({ agentId, deltaCents: expected_cost_cents, teamId: team?.id });
         }
         await org().appendEvent({
           orgId,
@@ -391,9 +409,10 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           payload: { agentId, vendor, metric, units, expectedCostCents: expected_cost_cents, note: note ?? null },
         });
 
-        const usage = await org().usage({ agentId });
+        const usage = await org().usage({ agentId, teamId: team?.id });
         const agentLimits = resolveAgentLimits(policy.rules, agentId);
         const orgLimits = resolveOrgLimits(policy.rules);
+        const teamLimits = resolveTeamLimits(policy.rules, team?.id);
         const overruns = [
           agentLimits?.dailyCents !== undefined &&
             usage.agentDailyCents > agentLimits.dailyCents &&
@@ -401,6 +420,12 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           agentLimits?.monthlyCents !== undefined &&
             usage.agentMonthlyCents > agentLimits.monthlyCents &&
             "agent monthly budget exceeded",
+          teamLimits?.dailyCents !== undefined &&
+            usage.teamDailyCents > teamLimits.dailyCents &&
+            `team "${team?.name}" daily budget exceeded`,
+          teamLimits?.monthlyCents !== undefined &&
+            usage.teamMonthlyCents > teamLimits.monthlyCents &&
+            `team "${team?.name}" monthly budget exceeded`,
           orgLimits?.dailyCents !== undefined &&
             usage.orgDailyCents > orgLimits.dailyCents &&
             "org daily budget exceeded",
@@ -433,10 +458,12 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
       async () => {
         const policy = await getActivePolicy(db, orgId);
         if (!policy) return jsonError("No spend policy configured for this org.");
-        const usage = await org().usage({ agentId });
+        const team = await getTeamForAgent(db, orgId, agentId);
+        const usage = await org().usage({ agentId, teamId: team?.id });
         const frozen = await org().isFrozen({ agentId });
         const agentLimits = resolveAgentLimits(policy.rules, agentId);
         const orgLimits = resolveOrgLimits(policy.rules);
+        const teamLimits = resolveTeamLimits(policy.rules, team?.id);
         return json({
           agent_id: agentId,
           frozen: frozen.frozen,
@@ -448,6 +475,16 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
             monthly_used_cents: usage.agentMonthlyCents,
             monthly_limit_cents: agentLimits?.monthlyCents ?? null,
           },
+          team: team
+            ? {
+                id: team.id,
+                name: team.name,
+                daily_used_cents: usage.teamDailyCents,
+                daily_limit_cents: teamLimits?.dailyCents ?? null,
+                monthly_used_cents: usage.teamMonthlyCents,
+                monthly_limit_cents: teamLimits?.monthlyCents ?? null,
+              }
+            : null,
           org: {
             daily_used_cents: usage.orgDailyCents,
             daily_limit_cents: orgLimits?.dailyCents ?? null,

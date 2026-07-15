@@ -3,10 +3,15 @@ import {
   getPolicyByVersion,
   getPurchaseRequest,
   getRequestByDecisionToken,
+  getTeamForAgent,
   applyHumanDecision,
   type PurchaseRequestRow,
 } from "./db";
-import { resolveAgentLimits, resolveOrgLimits } from "./policy";
+import {
+  resolveAgentLimits,
+  resolveOrgLimits,
+  resolveTeamLimits,
+} from "./policy";
 
 const fmt = (cents: number, currency: string) =>
   new Intl.NumberFormat("en-US", { style: "currency", currency }).format(
@@ -251,15 +256,22 @@ async function decideRequestRow(
   // pending), so enforce it now against the policy version the request was
   // evaluated under.
   const policy = await getPolicyByVersion(env.DB, row.org_id, row.policy_version);
+  const team = await getTeamForAgent(env.DB, row.org_id, row.agent_id);
   const reserve = await coordinator.reserve({
     agentId: row.agent_id,
     amountCents: row.amount_cents,
     orgLimits: policy ? resolveOrgLimits(policy.rules) : undefined,
     agentLimits: policy ? resolveAgentLimits(policy.rules, row.agent_id) : undefined,
+    teamId: team?.id,
+    teamLimits: policy ? resolveTeamLimits(policy.rules, team?.id) : undefined,
   });
 
   if (!reserve.ok) {
-    const reason = `Approved by ${approver}, but the ${reserve.exceeded.replaceAll("_", " ")} budget no longer fits this purchase (${reserve.usedCents}¢ of ${reserve.limitCents}¢ used).`;
+    const scopeName =
+      reserve.scope === "team"
+        ? `team "${team?.name ?? "unknown"}" ${reserve.period}`
+        : `${reserve.scope} ${reserve.period}`;
+    const reason = `Approved by ${approver}, but the ${scopeName} budget no longer fits this purchase (${reserve.usedCents}¢ of ${reserve.limitCents}¢ used).`;
     await applyHumanDecision(env.DB, {
       orgId: row.org_id,
       requestId: row.id,

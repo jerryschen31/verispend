@@ -60,6 +60,8 @@ export type PolicyRules = {
     perAgent?: BudgetLimits;
     /** Per-agent overrides, keyed by agent id. */
     agents?: Record<string, BudgetLimits>;
+    /** Shared limits across all agents of a team, keyed by team id. */
+    teams?: Record<string, BudgetLimits>;
   };
   /** Purchases matching these need a human decision instead of auto-approval. */
   escalation?: { amountCents?: number; categories?: string[] };
@@ -188,6 +190,14 @@ export function resolveAgentLimits(
 
 export function resolveOrgLimits(rules: PolicyRules): BudgetLimits | undefined {
   return rules.budgets?.org;
+}
+
+export function resolveTeamLimits(
+  rules: PolicyRules,
+  teamId: string | null | undefined
+): BudgetLimits | undefined {
+  if (!teamId) return undefined;
+  return rules.budgets?.teams?.[teamId];
 }
 
 export const DEFAULT_POLICY: PolicyRules = {

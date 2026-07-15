@@ -137,6 +137,149 @@ export async function countAdmins(db: D1Database, orgId: string): Promise<number
   return row?.n ?? 0;
 }
 
+// ---------- Teams (agent groups with shared budgets and approvers) ----------
+
+export type TeamRow = {
+  id: string;
+  org_id: string;
+  name: string;
+  created_at: string;
+};
+
+export async function createTeam(
+  db: D1Database,
+  args: { orgId: string; name: string }
+): Promise<{ teamId: string }> {
+  const teamId = `team_${crypto.randomUUID()}`;
+  await db
+    .prepare("INSERT INTO teams (id, org_id, name) VALUES (?, ?, ?)")
+    .bind(teamId, args.orgId, args.name.trim())
+    .run();
+  return { teamId };
+}
+
+export async function listTeams(
+  db: D1Database,
+  orgId: string
+): Promise<Array<TeamRow & { agent_count: number }>> {
+  const { results } = await db
+    .prepare(
+      `SELECT t.*, (SELECT COUNT(*) FROM team_agents ta WHERE ta.team_id = t.id) AS agent_count
+       FROM teams t WHERE t.org_id = ? ORDER BY t.created_at, t.name`
+    )
+    .bind(orgId)
+    .all<TeamRow & { agent_count: number }>();
+  return results;
+}
+
+export async function getTeam(
+  db: D1Database,
+  orgId: string,
+  teamId: string
+): Promise<TeamRow | null> {
+  return db
+    .prepare("SELECT * FROM teams WHERE org_id = ? AND id = ?")
+    .bind(orgId, teamId)
+    .first<TeamRow>();
+}
+
+export async function getTeamForAgent(
+  db: D1Database,
+  orgId: string,
+  agentId: string
+): Promise<TeamRow | null> {
+  return db
+    .prepare(
+      `SELECT t.* FROM teams t
+       JOIN team_agents ta ON ta.team_id = t.id
+       WHERE ta.org_id = ? AND ta.agent_id = ?`
+    )
+    .bind(orgId, agentId)
+    .first<TeamRow>();
+}
+
+/** Assign an agent to a team (replacing any previous team) or, with a null
+ * teamId, remove it from its team. */
+export async function setAgentTeam(
+  db: D1Database,
+  args: { orgId: string; agentId: string; teamId: string | null }
+): Promise<void> {
+  if (args.teamId === null) {
+    await db
+      .prepare("DELETE FROM team_agents WHERE org_id = ? AND agent_id = ?")
+      .bind(args.orgId, args.agentId)
+      .run();
+    return;
+  }
+  await db
+    .prepare(
+      "INSERT OR REPLACE INTO team_agents (org_id, team_id, agent_id) VALUES (?, ?, ?)"
+    )
+    .bind(args.orgId, args.teamId, args.agentId)
+    .run();
+}
+
+export async function listTeamAgents(
+  db: D1Database,
+  teamId: string
+): Promise<string[]> {
+  const { results } = await db
+    .prepare(
+      "SELECT agent_id FROM team_agents WHERE team_id = ? ORDER BY agent_id"
+    )
+    .bind(teamId)
+    .all<{ agent_id: string }>();
+  return results.map((r) => r.agent_id);
+}
+
+export async function setTeamApprover(
+  db: D1Database,
+  args: { teamId: string; memberId: string; on: boolean }
+): Promise<void> {
+  if (args.on) {
+    await db
+      .prepare(
+        "INSERT OR IGNORE INTO team_approvers (team_id, member_id) VALUES (?, ?)"
+      )
+      .bind(args.teamId, args.memberId)
+      .run();
+  } else {
+    await db
+      .prepare("DELETE FROM team_approvers WHERE team_id = ? AND member_id = ?")
+      .bind(args.teamId, args.memberId)
+      .run();
+  }
+}
+
+export async function listTeamApprovers(
+  db: D1Database,
+  teamId: string
+): Promise<OrgMemberRow[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT m.* FROM org_members m
+       JOIN team_approvers ta ON ta.member_id = m.id
+       WHERE ta.team_id = ? ORDER BY m.email`
+    )
+    .bind(teamId)
+    .all<OrgMemberRow>();
+  return results;
+}
+
+/** Distinct agent ids known to the org (from minted keys), for team UI. */
+export async function listKnownAgentIds(
+  db: D1Database,
+  orgId: string
+): Promise<string[]> {
+  const { results } = await db
+    .prepare(
+      "SELECT DISTINCT agent_id FROM agent_keys WHERE org_id = ? ORDER BY agent_id"
+    )
+    .bind(orgId)
+    .all<{ agent_id: string }>();
+  return results.map((r) => r.agent_id);
+}
+
 export async function getMemberById(
   db: D1Database,
   orgId: string,

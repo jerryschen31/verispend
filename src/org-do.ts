@@ -21,17 +21,45 @@ export type ReserveArgs = {
   amountCents: number;
   orgLimits?: BudgetLimits;
   agentLimits?: BudgetLimits;
+  /** Shared team budget scope; both must be set for team checks to apply. */
+  teamId?: string;
+  teamLimits?: BudgetLimits;
   /** Injectable clock for tests; defaults to now. */
   nowIso?: string;
 };
 
+export type BudgetScope = "agent" | "team" | "org";
+export type BudgetPeriod = "daily" | "monthly";
+
+/** One limit that was evaluated — approved decisions are explainable too. */
+export type BudgetCheck = {
+  scope: BudgetScope;
+  scopeId: string;
+  period: BudgetPeriod;
+  limitCents: number;
+  usedCents: number;
+};
+
+export type BudgetExceeded =
+  | "agent_daily"
+  | "agent_monthly"
+  | "team_daily"
+  | "team_monthly"
+  | "org_daily"
+  | "org_monthly";
+
 export type ReserveResult =
-  | { ok: true }
+  | { ok: true; checks: BudgetCheck[] }
   | {
       ok: false;
-      exceeded: "agent_daily" | "agent_monthly" | "org_daily" | "org_monthly";
+      exceeded: BudgetExceeded;
+      scope: BudgetScope;
+      scopeId: string;
+      period: BudgetPeriod;
       limitCents: number;
       usedCents: number;
+      /** Limits evaluated up to and including the one that failed. */
+      checks: BudgetCheck[];
     };
 
 export type UsageSnapshot = {
@@ -39,6 +67,9 @@ export type UsageSnapshot = {
   agentMonthlyCents: number;
   orgDailyCents: number;
   orgMonthlyCents: number;
+  /** Zero when the caller passed no teamId. */
+  teamDailyCents: number;
+  teamMonthlyCents: number;
 };
 
 export type BreakerCheckArgs = {
@@ -122,76 +153,103 @@ export class OrgCoordinator extends DurableObject<Env> {
     );
   }
 
+  // The scopes a call touches, in check order: agent, then team (when the
+  // caller resolved one), then org.
+  #scopes(args: { agentId: string; teamId?: string }): string[] {
+    const scopes = [`agent:${args.agentId}`];
+    if (args.teamId) scopes.push(`team:${args.teamId}`);
+    scopes.push("org");
+    return scopes;
+  }
+
   // Fully synchronous (SQL storage ops don't yield), so each call is atomic
   // with respect to other DO events.
   reserve(args: ReserveArgs): ReserveResult {
     const { day, month } = periods(args.nowIso);
-    const agentScope = `agent:${args.agentId}`;
 
-    const checks: Array<{
-      exceeded: Exclude<ReserveResult, { ok: true }>["exceeded"];
+    const candidates: Array<{
+      scope: BudgetScope;
+      scopeId: string;
+      period: BudgetPeriod;
+      periodKey: string;
+      spendScope: string;
       limit: number | undefined;
-      used: number;
-    }> = [
-      {
-        exceeded: "agent_daily",
-        limit: args.agentLimits?.dailyCents,
-        used: this.#used(day, agentScope),
-      },
-      {
-        exceeded: "agent_monthly",
-        limit: args.agentLimits?.monthlyCents,
-        used: this.#used(month, agentScope),
-      },
-      {
-        exceeded: "org_daily",
-        limit: args.orgLimits?.dailyCents,
-        used: this.#used(day, "org"),
-      },
-      {
-        exceeded: "org_monthly",
-        limit: args.orgLimits?.monthlyCents,
-        used: this.#used(month, "org"),
-      },
-    ];
+    }> = [];
+    const scoped = (
+      scope: BudgetScope,
+      scopeId: string,
+      spendScope: string,
+      limits: BudgetLimits | undefined
+    ) => {
+      candidates.push(
+        { scope, scopeId, period: "daily", periodKey: day, spendScope, limit: limits?.dailyCents },
+        { scope, scopeId, period: "monthly", periodKey: month, spendScope, limit: limits?.monthlyCents }
+      );
+    };
+    scoped("agent", args.agentId, `agent:${args.agentId}`, args.agentLimits);
+    if (args.teamId && args.teamLimits) {
+      scoped("team", args.teamId, `team:${args.teamId}`, args.teamLimits);
+    }
+    scoped("org", "org", "org", args.orgLimits);
 
-    for (const check of checks) {
-      if (check.limit !== undefined && check.used + args.amountCents > check.limit) {
+    const checks: BudgetCheck[] = [];
+    for (const candidate of candidates) {
+      if (candidate.limit === undefined) continue;
+      const used = this.#used(candidate.periodKey, candidate.spendScope);
+      checks.push({
+        scope: candidate.scope,
+        scopeId: candidate.scopeId,
+        period: candidate.period,
+        limitCents: candidate.limit,
+        usedCents: used,
+      });
+      if (used + args.amountCents > candidate.limit) {
         return {
           ok: false,
-          exceeded: check.exceeded,
-          limitCents: check.limit,
-          usedCents: check.used,
+          exceeded: `${candidate.scope}_${candidate.period}` as BudgetExceeded,
+          scope: candidate.scope,
+          scopeId: candidate.scopeId,
+          period: candidate.period,
+          limitCents: candidate.limit,
+          usedCents: used,
+          checks,
         };
       }
     }
 
-    this.#add(day, agentScope, args.amountCents);
-    this.#add(month, agentScope, args.amountCents);
-    this.#add(day, "org", args.amountCents);
-    this.#add(month, "org", args.amountCents);
-    return { ok: true };
+    for (const scope of this.#scopes(args)) {
+      this.#add(day, scope, args.amountCents);
+      this.#add(month, scope, args.amountCents);
+    }
+    return { ok: true, checks };
   }
 
   // Unchecked counter adjustment: outcome corrections (final charge differed
   // from the approved amount) and releases (approved but never executed).
-  adjust(args: { agentId: string; deltaCents: number; nowIso?: string }): void {
+  adjust(args: {
+    agentId: string;
+    deltaCents: number;
+    teamId?: string;
+    nowIso?: string;
+  }): void {
     const { day, month } = periods(args.nowIso);
-    const agentScope = `agent:${args.agentId}`;
-    this.#add(day, agentScope, args.deltaCents);
-    this.#add(month, agentScope, args.deltaCents);
-    this.#add(day, "org", args.deltaCents);
-    this.#add(month, "org", args.deltaCents);
+    for (const scope of this.#scopes(args)) {
+      this.#add(day, scope, args.deltaCents);
+      this.#add(month, scope, args.deltaCents);
+    }
   }
 
-  usage(args: { agentId: string; nowIso?: string }): UsageSnapshot {
+  usage(args: { agentId: string; teamId?: string; nowIso?: string }): UsageSnapshot {
     const { day, month } = periods(args.nowIso);
     const agentScope = `agent:${args.agentId}`;
+    const teamScope = args.teamId ? `team:${args.teamId}` : null;
     return {
       agentDailyCents: this.#used(day, agentScope),
       agentMonthlyCents: this.#used(month, agentScope),
       orgDailyCents: this.#used(day, "org"),
       orgMonthlyCents: this.#used(month, "org"),
+      teamDailyCents: teamScope ? this.#used(day, teamScope) : 0,
+      teamMonthlyCents: teamScope ? this.#used(month, teamScope) : 0,
     };
   }
 

@@ -6,11 +6,17 @@ import {
   MEMBER_ROLES,
   createAgentKey,
   createOrg,
+  createTeam,
+  getActivePolicy,
+  getMembership,
   getOrg,
   insertPolicy,
+  setAgentTeam,
+  setTeamApprover,
   upsertMember,
   type MemberRole,
 } from "./db";
+import type { BudgetLimits } from "./policy";
 import { ingestBill } from "./reconcile";
 import { DEFAULT_POLICY, type PolicyRules } from "./policy";
 import { VeriSpendMCP } from "./mcp";
@@ -137,6 +143,61 @@ app.post("/api/admin/orgs/:orgId/members", async (c) => {
     role: body.role,
   });
   return c.json({ member_id: id, email: body.email.trim().toLowerCase(), role: body.role });
+});
+
+// Team provisioning for API-driven workflows (and the agent simulator). The
+// dashboard's teams pages are the session-guarded equivalent.
+app.post("/api/admin/orgs/:orgId/teams", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  if (!(await getOrg(c.env.DB, orgId))) {
+    return c.json({ error: "no such org" }, 404);
+  }
+  const body = await c.req.json<{
+    name?: string;
+    agent_ids?: string[];
+    approver_emails?: string[];
+    budgets?: BudgetLimits;
+  }>();
+  if (!body.name?.trim()) return c.json({ error: "name is required" }, 400);
+
+  const { teamId } = await createTeam(c.env.DB, { orgId, name: body.name });
+  for (const agentId of body.agent_ids ?? []) {
+    await setAgentTeam(c.env.DB, { orgId, agentId, teamId });
+  }
+  for (const email of body.approver_emails ?? []) {
+    const member = await getMembership(c.env.DB, orgId, email);
+    if (!member || member.role === "viewer") {
+      return c.json(
+        { error: `approver_emails must be existing non-viewer members: ${email}` },
+        400
+      );
+    }
+    await setTeamApprover(c.env.DB, { teamId, memberId: member.id, on: true });
+  }
+
+  let policyVersion: number | null = null;
+  if (body.budgets) {
+    const policy = await getActivePolicy(c.env.DB, orgId);
+    if (!policy) return c.json({ error: "org has no policy" }, 400);
+    const rules = { ...policy.rules };
+    rules.budgets = {
+      ...rules.budgets,
+      teams: { ...rules.budgets?.teams, [teamId]: body.budgets },
+    };
+    const { version } = await insertPolicy(c.env.DB, { orgId, rules });
+    policyVersion = version;
+    await c.env.ORG.getByName(orgId).appendEvent({
+      orgId,
+      requestId: "policy",
+      eventType: "policy_updated",
+      payload: { version, editedBy: "admin-api", via: "teams_api", teamId },
+    });
+  }
+
+  return c.json({ team_id: teamId, policy_version: policyVersion });
 });
 
 // Bill ingestion for API-driven workflows (and the agent simulator). The
