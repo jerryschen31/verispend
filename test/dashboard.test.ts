@@ -217,6 +217,94 @@ describe("dashboard", () => {
     expect(await new McpSession(newKey!).initialize()).toBe(401);
   });
 
+  it("surfaces frozen agents and unfreezes them", async () => {
+    // Freeze an agent directly via the coordinator (breaker-flow tests cover
+    // tripping through MCP traffic).
+    const coordinator = env.ORG.getByName(orgId);
+    const rules = {
+      enabled: true,
+      identical: { count: 2, windowMinutes: 10 },
+      velocity: { count: 100, windowMinutes: 5 },
+      acceleration: { multiplier: 4, windowMinutes: 60, minSpendCents: 1_000_00 },
+    };
+    const args = {
+      agentId: "dash-agent",
+      vendor: "LoopMart",
+      amountCents: 2_00,
+      category: "data",
+      breakerRules: rules,
+    };
+    await coordinator.recordAndCheck(args);
+    const second = await coordinator.recordAndCheck(args);
+    expect(second.status).toBe("tripped");
+
+    // Overview banner and keys page both show the freeze.
+    expect(await (await get("/dashboard")).text()).toContain("frozen agent");
+    const keysHtml = await (await get("/dashboard/keys")).text();
+    expect(keysHtml).toContain("Frozen agents");
+    expect(keysHtml).toContain("LoopMart");
+
+    // Unfreeze via the dashboard.
+    const res = await postForm("/dashboard/agents/unfreeze", {
+      agent_id: "dash-agent",
+    });
+    expect(res.status).toBe(302);
+    expect(await coordinator.isFrozen({ agentId: "dash-agent" })).toEqual({
+      frozen: false,
+    });
+    expect(await (await get("/dashboard/keys")).text()).not.toContain(
+      "Frozen agents"
+    );
+
+    // The reset landed on the ledger.
+    const reset = await env.DB.prepare(
+      "SELECT payload_json FROM ledger_events WHERE org_id = ? AND event_type = 'breaker_reset'"
+    )
+      .bind(orgId)
+      .first<{ payload_json: string }>();
+    expect(JSON.parse(reset!.payload_json)).toMatchObject({
+      agentId: "dash-agent",
+      unfrozenBy: APPROVER,
+    });
+  });
+
+  it("enters a bill on the reconciliation page and shows the verdict", async () => {
+    const session = new McpSession(apiKey);
+    await session.initialize();
+    await session.call("record_usage", {
+      vendor: "ComputeCo",
+      metric: "gpu_hours",
+      units: 3,
+      expected_cost_cents: 24_00,
+    });
+
+    const today = new Date().toISOString().slice(0, 10);
+    const res = await postForm("/dashboard/bills", {
+      vendor: "ComputeCo",
+      period_start: today,
+      period_end: today,
+      amount_cents: "3600",
+      memo: "double-charged retries",
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/dashboard/reconciliation");
+
+    const html = await (await get("/dashboard/reconciliation")).text();
+    expect(html).toContain("ComputeCo");
+    expect(html).toContain("overbilled");
+    expect(html).toContain("gpu_hours");
+
+    // Invalid input round-trips as an error message, not a 500.
+    const bad = await postForm("/dashboard/bills", {
+      vendor: "ComputeCo",
+      period_start: "yesterday",
+      period_end: today,
+      amount_cents: "100",
+    });
+    expect(bad.status).toBe(302);
+    expect(bad.headers.get("location")).toContain("error=");
+  });
+
   it("reports ledger integrity on the audit page", async () => {
     const res = await get("/dashboard/audit");
     const html = await res.text();

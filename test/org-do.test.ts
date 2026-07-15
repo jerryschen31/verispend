@@ -94,6 +94,97 @@ describe("OrgCoordinator budgets", () => {
   });
 });
 
+describe("OrgCoordinator circuit breaker", () => {
+  const breakerRules = {
+    enabled: true,
+    identical: { count: 3, windowMinutes: 10 },
+    velocity: { count: 20, windowMinutes: 5 },
+    acceleration: { multiplier: 4, windowMinutes: 60, minSpendCents: 1_000_00 },
+  };
+  const atMinute = (m: number) =>
+    new Date(Date.parse(NOW) + m * 60_000).toISOString();
+  const check = (
+    stub: ReturnType<typeof env.ORG.getByName>,
+    agentId: string,
+    nowIso: string,
+    over: Partial<{ vendor: string; amountCents: number; category: string }> = {}
+  ) =>
+    stub.recordAndCheck({
+      agentId,
+      vendor: "OpenAI",
+      amountCents: 5_00,
+      category: "api",
+      breakerRules,
+      nowIso,
+      ...over,
+    });
+
+  it("trips on an identical-request loop and persists the freeze", async () => {
+    const stub = env.ORG.getByName("org-breaker-loop");
+    expect((await check(stub, "loop", atMinute(0))).status).toBe("ok");
+    expect((await check(stub, "loop", atMinute(1))).status).toBe("ok");
+    const third = await check(stub, "loop", atMinute(2));
+    expect(third).toMatchObject({ status: "tripped", signal: "identical_loop" });
+
+    // Now frozen: further requests short-circuit without re-evaluating.
+    const fourth = await check(stub, "loop", atMinute(3));
+    expect(fourth).toMatchObject({ status: "frozen" });
+    expect(await stub.isFrozen({ agentId: "loop" })).toMatchObject({ frozen: true });
+
+    // Other agents in the org are unaffected.
+    expect((await check(stub, "other-agent", atMinute(3))).status).toBe("ok");
+
+    const frozen = await stub.frozenAgents();
+    expect(frozen).toHaveLength(1);
+    expect(frozen[0]).toMatchObject({ agent_id: "loop", signal: "identical_loop" });
+  });
+
+  it("unfreeze restores the agent (and reports missing freezes)", async () => {
+    const stub = env.ORG.getByName("org-breaker-unfreeze");
+    await check(stub, "a", atMinute(0));
+    await check(stub, "a", atMinute(1));
+    expect((await check(stub, "a", atMinute(2))).status).toBe("tripped");
+
+    expect(await stub.unfreeze({ agentId: "a" })).toEqual({ ok: true });
+    expect(await stub.unfreeze({ agentId: "a" })).toEqual({ ok: false });
+    expect(await stub.isFrozen({ agentId: "a" })).toEqual({ frozen: false });
+
+    // History persists, so the very next identical request re-trips.
+    expect((await check(stub, "a", atMinute(3))).status).toBe("tripped");
+  });
+
+  it("ignores identical requests outside the detection window", async () => {
+    const stub = env.ORG.getByName("org-breaker-window");
+    await check(stub, "a", atMinute(0));
+    await check(stub, "a", atMinute(1));
+    // 11+ minutes later: the earlier pair is outside the 10-minute window.
+    expect((await check(stub, "a", atMinute(12))).status).toBe("ok");
+
+    // 25h later everything is pruned; two fresh identical requests don't trip.
+    const dayLater = atMinute(25 * 60);
+    expect((await check(stub, "a", dayLater)).status).toBe("ok");
+    expect(
+      (await check(stub, "a", atMinute(25 * 60 + 1))).status
+    ).toBe("ok");
+  });
+
+  it("trips on velocity across distinct requests", async () => {
+    const stub = env.ORG.getByName("org-breaker-velocity");
+    for (let i = 0; i < 19; i++) {
+      const result = await check(stub, "fast", atMinute(1), {
+        vendor: `vendor-${i}`,
+        amountCents: 10 + i,
+      });
+      expect(result.status).toBe("ok");
+    }
+    const twentieth = await check(stub, "fast", atMinute(2), {
+      vendor: "vendor-final",
+      amountCents: 7,
+    });
+    expect(twentieth).toMatchObject({ status: "tripped", signal: "velocity" });
+  });
+});
+
 describe("OrgCoordinator ledger appends", () => {
   it("keeps the hash chain intact under concurrent appends", async () => {
     const orgId = "org-ledger";

@@ -9,12 +9,16 @@ import {
   getOrgByApproverEmail,
   insertPolicy,
   listAgentKeys,
+  listBilledCharges,
   listPurchaseRequests,
+  listUsageRecords,
   revokeAgentKey,
   type PurchaseRequestRow,
   type RequestStatus,
 } from "./db";
+import { ingestBill } from "./reconcile";
 import { verifyLedgerChain } from "./ledger";
+import type { FrozenAgentRow } from "./org-do";
 import type { PolicyRules } from "./policy";
 import {
   SESSION_COOKIE,
@@ -76,6 +80,7 @@ const Layout = (props: { title: string; orgName?: string; children: Child }) => 
         <span class="brand">VeriSpend</span>
         <a href="/dashboard">Approvals</a>
         <a href="/dashboard/ledger">Ledger</a>
+        <a href="/dashboard/reconciliation">Reconciliation</a>
         <a href="/dashboard/policy">Policy</a>
         <a href="/dashboard/keys">Agent Keys</a>
         <a href="/dashboard/audit">Audit</a>
@@ -254,9 +259,25 @@ dashboard.use("/dashboard/*", requireSession);
 
 // ---------- Views ----------
 
+const FrozenBanner = ({ frozen }: { frozen: FrozenAgentRow[] }) =>
+  frozen.length === 0 ? null : (
+    <div style="background:#fef2f2;border:1px solid #dc2626;border-radius:8px;padding:0.8rem 1rem;margin-bottom:1.2rem">
+      <strong style="color:#dc2626">
+        Circuit breaker: {frozen.length} frozen agent{frozen.length > 1 ? "s" : ""}
+      </strong>
+      {frozen.map((f) => (
+        <div class="muted" style="margin-top:0.3rem">
+          <code>{f.agent_id}</code> — {f.reason}{" "}
+          <a href="/dashboard/keys">Review</a>
+        </div>
+      ))}
+    </div>
+  );
+
 dashboard.get("/dashboard", async (c) => {
   const orgId = c.get("orgId");
   const org = await getOrg(c.env.DB, orgId);
+  const frozen = await c.env.ORG.getByName(orgId).frozenAgents();
   const pending = await listPurchaseRequests(c.env.DB, orgId, {
     status: "pending_approval",
   });
@@ -266,6 +287,7 @@ dashboard.get("/dashboard", async (c) => {
 
   return c.html(
     <Layout title="Approvals" orgName={org?.name}>
+      <FrozenBanner frozen={frozen} />
       <h2>Pending approvals ({pending.length})</h2>
       {pending.length === 0 ? (
         <p class="muted">Nothing waiting on you.</p>
@@ -354,6 +376,135 @@ dashboard.get("/dashboard/ledger.csv", async (c) => {
   });
 });
 
+const RECON_COLORS: Record<string, string> = {
+  ok: "#16a34a",
+  overbilled: "#dc2626",
+  underbilled: "#d97706",
+  no_usage_data: "#d97706",
+};
+
+dashboard.get("/dashboard/reconciliation", async (c) => {
+  const orgId = c.get("orgId");
+  const org = await getOrg(c.env.DB, orgId);
+  const bills = await listBilledCharges(c.env.DB, orgId);
+  const usage = await listUsageRecords(c.env.DB, orgId, 25);
+  const error = c.req.query("error");
+
+  return c.html(
+    <Layout title="Reconciliation" orgName={org?.name}>
+      <h2>Enter a provider bill</h2>
+      <p class="muted">
+        VeriSpend compares the billed amount against what your agents reported
+        consuming (via <code>record_usage</code>) in the same period, and flags
+        over-charges.
+      </p>
+      {error && <p style="color:#dc2626">{error}</p>}
+      <form method="post" action="/dashboard/bills" style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1.5rem">
+        <input name="vendor" placeholder="Vendor, e.g. OpenAI" required />
+        <input name="period_start" type="date" required />
+        <input name="period_end" type="date" required />
+        <input name="amount_cents" type="number" min="1" placeholder="Amount (cents)" required />
+        <input name="memo" placeholder="Memo (optional)" />
+        <button class="btn" style="background:#0f172a">Reconcile</button>
+      </form>
+
+      <h2>Bills</h2>
+      {bills.length === 0 ? (
+        <p class="muted">No bills entered yet.</p>
+      ) : (
+        <table>
+          <tr>
+            <th>Entered (UTC)</th>
+            <th>Vendor</th>
+            <th>Period</th>
+            <th>Billed</th>
+            <th>Expected</th>
+            <th>Variance</th>
+            <th>Status</th>
+          </tr>
+          {bills.map((b) => (
+            <tr>
+              <td>{b.created_at.slice(0, 16).replace("T", " ")}</td>
+              <td>
+                {b.vendor}
+                {b.memo && <div class="muted">{b.memo}</div>}
+              </td>
+              <td>
+                {b.period_start} → {b.period_end}
+              </td>
+              <td>{fmt(b.amount_cents)}</td>
+              <td>{fmt(b.expected_cents)}</td>
+              <td style={b.variance_cents > 0 ? "color:#dc2626" : undefined}>
+                {b.variance_cents >= 0 ? "+" : ""}
+                {fmt(b.variance_cents)}
+              </td>
+              <td>
+                <span
+                  class="pill"
+                  style={`background:${RECON_COLORS[b.recon_status] ?? "#6b7280"}`}
+                >
+                  {b.recon_status.replaceAll("_", " ")}
+                </span>
+              </td>
+            </tr>
+          ))}
+        </table>
+      )}
+
+      <h2>Recent usage reports</h2>
+      {usage.length === 0 ? (
+        <p class="muted">
+          No usage recorded yet. Agents report metered consumption with the{" "}
+          <code>record_usage</code> tool.
+        </p>
+      ) : (
+        <table>
+          <tr>
+            <th>When (UTC)</th>
+            <th>Agent</th>
+            <th>Vendor</th>
+            <th>Metric</th>
+            <th>Units</th>
+            <th>Expected cost</th>
+          </tr>
+          {usage.map((u) => (
+            <tr>
+              <td>{u.created_at.slice(0, 16).replace("T", " ")}</td>
+              <td>{u.agent_id}</td>
+              <td>
+                {u.vendor}
+                {u.note && <div class="muted">{u.note}</div>}
+              </td>
+              <td>{u.metric}</td>
+              <td>{u.units}</td>
+              <td>{fmt(u.expected_cost_cents)}</td>
+            </tr>
+          ))}
+        </table>
+      )}
+    </Layout>
+  );
+});
+
+dashboard.post("/dashboard/bills", async (c) => {
+  const form = await c.req.formData();
+  const result = await ingestBill(c.env, {
+    orgId: c.get("orgId"),
+    vendor: String(form.get("vendor") ?? ""),
+    periodStart: String(form.get("period_start") ?? ""),
+    periodEnd: String(form.get("period_end") ?? ""),
+    amountCents: Number(form.get("amount_cents")),
+    memo: String(form.get("memo") ?? "") || undefined,
+    enteredBy: c.get("email"),
+  });
+  if (!result.ok) {
+    return c.redirect(
+      `/dashboard/reconciliation?error=${encodeURIComponent(result.error)}`
+    );
+  }
+  return c.redirect("/dashboard/reconciliation");
+});
+
 dashboard.get("/dashboard/policy", async (c) => {
   const org = await getOrg(c.env.DB, c.get("orgId"));
   const policy = await getActivePolicy(c.env.DB, c.get("orgId"));
@@ -404,10 +555,43 @@ dashboard.post("/dashboard/policy", async (c) => {
 });
 
 dashboard.get("/dashboard/keys", async (c) => {
-  const org = await getOrg(c.env.DB, c.get("orgId"));
-  const keys = await listAgentKeys(c.env.DB, c.get("orgId"));
+  const orgId = c.get("orgId");
+  const org = await getOrg(c.env.DB, orgId);
+  const keys = await listAgentKeys(c.env.DB, orgId);
+  const frozen = await c.env.ORG.getByName(orgId).frozenAgents();
   return c.html(
     <Layout title="Agent keys" orgName={org?.name}>
+      {frozen.length > 0 && (
+        <>
+          <h2>Frozen agents</h2>
+          <table style="margin-bottom:1.5rem">
+            <tr>
+              <th>Agent</th>
+              <th>Frozen (UTC)</th>
+              <th>Signal</th>
+              <th>Reason</th>
+              <th />
+            </tr>
+            {frozen.map((f) => (
+              <tr>
+                <td>
+                  <span class="pill" style="background:#dc2626">frozen</span>{" "}
+                  {f.agent_id}
+                </td>
+                <td>{f.frozen_at.slice(0, 16).replace("T", " ")}</td>
+                <td>{f.signal.replaceAll("_", " ")}</td>
+                <td class="muted">{f.reason}</td>
+                <td>
+                  <form method="post" action="/dashboard/agents/unfreeze">
+                    <input type="hidden" name="agent_id" value={f.agent_id} />
+                    <button class="btn" style="background:#16a34a">Unfreeze</button>
+                  </form>
+                </td>
+              </tr>
+            ))}
+          </table>
+        </>
+      )}
       <h2>Agent API keys</h2>
       <form method="post" action="/dashboard/keys/create" style="display:flex;gap:0.5rem;margin-bottom:1rem">
         <input name="agent_id" placeholder="Agent id, e.g. travel-agent" required />
@@ -466,6 +650,24 @@ dashboard.post("/dashboard/keys/create", async (c) => {
       <a href="/dashboard/keys">Back to keys</a>
     </Layout>
   );
+});
+
+dashboard.post("/dashboard/agents/unfreeze", async (c) => {
+  const form = await c.req.formData();
+  const agentId = String(form.get("agent_id") ?? "").trim();
+  if (!agentId) return c.text("agent_id is required", 400);
+  const orgId = c.get("orgId");
+  const coordinator = c.env.ORG.getByName(orgId);
+  const { ok } = await coordinator.unfreeze({ agentId });
+  if (ok) {
+    await coordinator.appendEvent({
+      orgId,
+      requestId: "breaker",
+      eventType: "breaker_reset",
+      payload: { agentId, unfrozenBy: c.get("email") },
+    });
+  }
+  return c.redirect("/dashboard/keys");
 });
 
 dashboard.post("/dashboard/keys/revoke", async (c) => {

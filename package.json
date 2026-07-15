@@ -10,7 +10,8 @@
     "types": "wrangler types",
     "check": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "simulate": "node scripts/simulate.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

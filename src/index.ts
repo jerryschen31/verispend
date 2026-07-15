@@ -2,7 +2,8 @@ import { Hono } from "hono";
 import { decideRequest } from "./approvals";
 import { dashboard } from "./dashboard";
 import { authenticateApiKey, bearerToken, timingSafeEqualStr } from "./auth";
-import { createAgentKey, createOrg, insertPolicy } from "./db";
+import { createAgentKey, createOrg, getOrg, insertPolicy } from "./db";
+import { ingestBill } from "./reconcile";
 import { DEFAULT_POLICY, type PolicyRules } from "./policy";
 import { VeriSpendMCP } from "./mcp";
 import { OrgCoordinator } from "./org-do";
@@ -35,11 +36,16 @@ app.get("/decide/:token/:action", async (c) => {
   return c.html(page, outcome.ok ? 200 : 410);
 });
 
+const requireAdminKey = async (c: { req: { header(name: string): string | undefined }; env: Env }) => {
+  const provided = c.req.header("x-admin-key") ?? "";
+  if (!c.env.ADMIN_KEY) return false;
+  return timingSafeEqualStr(provided, c.env.ADMIN_KEY);
+};
+
 // Bootstrap provisioning until the dashboard exists: creates an org with the
 // default policy and one agent API key. Guarded by the ADMIN_KEY secret.
 app.post("/api/admin/orgs", async (c) => {
-  const provided = c.req.header("x-admin-key") ?? "";
-  if (!c.env.ADMIN_KEY || !(await timingSafeEqualStr(provided, c.env.ADMIN_KEY))) {
+  if (!(await requireAdminKey(c))) {
     return c.json({ error: "unauthorized" }, 401);
   }
 
@@ -71,6 +77,60 @@ app.post("/api/admin/orgs", async (c) => {
     policy_version: version,
     agent_id: body.agent_id,
     api_key: apiKey, // shown exactly once; only a hash is stored
+  });
+});
+
+// Additional agent keys for an existing org (the dashboard's key page is the
+// session-guarded equivalent).
+app.post("/api/admin/orgs/:orgId/keys", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  if (!(await getOrg(c.env.DB, orgId))) {
+    return c.json({ error: "no such org" }, 404);
+  }
+  const body = await c.req.json<{ agent_id?: string }>();
+  if (!body.agent_id) return c.json({ error: "agent_id is required" }, 400);
+  const { apiKey } = await createAgentKey(c.env.DB, {
+    orgId,
+    agentId: body.agent_id,
+  });
+  return c.json({ agent_id: body.agent_id, api_key: apiKey });
+});
+
+// Bill ingestion for API-driven workflows (and the agent simulator). The
+// dashboard form at /dashboard/bills is the session-guarded equivalent.
+app.post("/api/admin/orgs/:orgId/bills", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  if (!(await getOrg(c.env.DB, orgId))) {
+    return c.json({ error: "no such org" }, 404);
+  }
+  const body = await c.req.json<{
+    vendor?: string;
+    period_start?: string;
+    period_end?: string;
+    amount_cents?: number;
+    memo?: string;
+  }>();
+  const result = await ingestBill(c.env, {
+    orgId,
+    vendor: body.vendor ?? "",
+    periodStart: body.period_start ?? "",
+    periodEnd: body.period_end ?? "",
+    amountCents: body.amount_cents ?? 0,
+    memo: body.memo,
+    enteredBy: "admin-api",
+  });
+  if (!result.ok) return c.json({ error: result.error }, 400);
+  return c.json({
+    bill_id: result.bill.id,
+    expected_cents: result.bill.expected_cents,
+    variance_cents: result.bill.variance_cents,
+    recon_status: result.bill.recon_status,
   });
 });
 
