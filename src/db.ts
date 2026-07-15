@@ -277,6 +277,131 @@ export async function getPurchaseRequest(
     .first<PurchaseRequestRow>();
 }
 
+export type UsageRecordRow = {
+  id: string;
+  org_id: string;
+  agent_id: string;
+  vendor: string;
+  metric: string;
+  units: number;
+  expected_cost_cents: number;
+  note: string | null;
+  created_at: string;
+};
+
+export async function insertUsageRecord(
+  db: D1Database,
+  row: Omit<UsageRecordRow, "created_at">
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO usage_records
+         (id, org_id, agent_id, vendor, metric, units, expected_cost_cents, note)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      row.id,
+      row.org_id,
+      row.agent_id,
+      row.vendor,
+      row.metric,
+      row.units,
+      row.expected_cost_cents,
+      row.note
+    )
+    .run();
+}
+
+export async function listUsageRecords(
+  db: D1Database,
+  orgId: string,
+  limit = 100
+): Promise<UsageRecordRow[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT * FROM usage_records WHERE org_id = ?
+       ORDER BY created_at DESC, id DESC LIMIT ?`
+    )
+    .bind(orgId, limit)
+    .all<UsageRecordRow>();
+  return results;
+}
+
+/**
+ * Sum of expected costs reported for a vendor over an inclusive date range.
+ * Vendor matching uses the same trim/lowercase semantics as policy rules.
+ */
+export async function sumExpectedCost(
+  db: D1Database,
+  args: { orgId: string; vendor: string; periodStart: string; periodEnd: string }
+): Promise<number> {
+  const row = await db
+    .prepare(
+      `SELECT COALESCE(SUM(expected_cost_cents), 0) AS total
+       FROM usage_records
+       WHERE org_id = ? AND LOWER(TRIM(vendor)) = LOWER(TRIM(?))
+         AND date(created_at) >= date(?) AND date(created_at) <= date(?)`
+    )
+    .bind(args.orgId, args.vendor, args.periodStart, args.periodEnd)
+    .first<{ total: number }>();
+  return row?.total ?? 0;
+}
+
+export type BilledChargeRow = {
+  id: string;
+  org_id: string;
+  vendor: string;
+  period_start: string;
+  period_end: string;
+  amount_cents: number;
+  memo: string | null;
+  expected_cents: number;
+  variance_cents: number;
+  recon_status: string;
+  created_at: string;
+};
+
+export async function insertBilledCharge(
+  db: D1Database,
+  row: Omit<BilledChargeRow, "created_at">
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO billed_charges
+         (id, org_id, vendor, period_start, period_end, amount_cents, memo,
+          expected_cents, variance_cents, recon_status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      row.id,
+      row.org_id,
+      row.vendor,
+      row.period_start,
+      row.period_end,
+      row.amount_cents,
+      row.memo,
+      row.expected_cents,
+      row.variance_cents,
+      row.recon_status
+    )
+    .run();
+}
+
+export async function listBilledCharges(
+  db: D1Database,
+  orgId: string,
+  limit = 100
+): Promise<BilledChargeRow[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT * FROM billed_charges WHERE org_id = ?
+       ORDER BY created_at DESC, id DESC LIMIT ?`
+    )
+    .bind(orgId, limit)
+    .all<BilledChargeRow>();
+  return results;
+}
+
 export async function markOutcomeRecorded(
   db: D1Database,
   args: {

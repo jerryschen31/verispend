@@ -7,6 +7,47 @@ export type BudgetLimits = {
   monthlyCents?: number;
 };
 
+export type CircuitBreakerRules = {
+  /** Breaker is on by default; set false to opt an org out entirely. */
+  enabled?: boolean;
+  /** Same (vendor, amount, category) repeating: runaway-loop signature. */
+  identical?: { count: number; windowMinutes: number };
+  /** Total request rate from one agent, regardless of contents. */
+  velocity?: { count: number; windowMinutes: number };
+  /** Requested spend in the window vs the agent's trailing 24h baseline. */
+  acceleration?: {
+    multiplier: number;
+    windowMinutes: number;
+    /** Floor below which acceleration never trips (new agents have no baseline). */
+    minSpendCents: number;
+  };
+};
+
+export type ResolvedBreakerRules = Required<CircuitBreakerRules>;
+
+export const BREAKER_DEFAULTS: ResolvedBreakerRules = {
+  enabled: true,
+  identical: { count: 5, windowMinutes: 10 },
+  velocity: { count: 30, windowMinutes: 5 },
+  acceleration: { multiplier: 4, windowMinutes: 60, minSpendCents: 50_00 },
+};
+
+export function resolveBreakerRules(rules: PolicyRules): ResolvedBreakerRules {
+  const cb = rules.circuitBreaker;
+  return {
+    enabled: cb?.enabled ?? BREAKER_DEFAULTS.enabled,
+    identical: cb?.identical ?? BREAKER_DEFAULTS.identical,
+    velocity: cb?.velocity ?? BREAKER_DEFAULTS.velocity,
+    acceleration: cb?.acceleration ?? BREAKER_DEFAULTS.acceleration,
+  };
+}
+
+export type ReconciliationRules = {
+  /** Absolute variance floor; flag only above max(this, percent of expected). */
+  toleranceCents?: number;
+  tolerancePercent?: number;
+};
+
 export type PolicyRules = {
   /** ISO 4217 code all rules are denominated in, e.g. "USD". */
   currency: string;
@@ -22,6 +63,10 @@ export type PolicyRules = {
   };
   /** Purchases matching these need a human decision instead of auto-approval. */
   escalation?: { amountCents?: number; categories?: string[] };
+  /** Runaway-agent circuit breaker; defaults apply when omitted. */
+  circuitBreaker?: CircuitBreakerRules;
+  /** Metered-bill reconciliation tolerances; defaults apply when omitted. */
+  reconciliation?: ReconciliationRules;
 };
 
 export type PurchaseIntent = {
@@ -38,7 +83,7 @@ export type StaticDecision =
   | { decision: "denied"; ruleFired: string; reason: string }
   | { decision: "pending_approval"; ruleFired: string; reason: string };
 
-const norm = (s: string) => s.trim().toLowerCase();
+export const norm = (s: string) => s.trim().toLowerCase();
 
 const includesNorm = (list: string[] | undefined, value: string) =>
   (list ?? []).some((item) => norm(item) === norm(value));

@@ -74,6 +74,96 @@ export async function sendApprovalEmail(
   }
 }
 
+export async function sendBreakerAlertEmail(
+  env: Env,
+  args: {
+    approverEmail: string;
+    orgName: string;
+    agentId: string;
+    signal: string;
+    reason: string;
+  }
+): Promise<void> {
+  const dashboardUrl = `${env.BASE_URL}/dashboard/keys`;
+  const text = [
+    `VeriSpend froze agent "${args.agentId}" at ${args.orgName}.`,
+    ``,
+    `Signal: ${args.signal.replaceAll("_", " ")}`,
+    `Reason: ${args.reason}`,
+    ``,
+    `All further purchases by this agent are denied until you unfreeze it:`,
+    dashboardUrl,
+  ].join("\n");
+
+  const html = `
+    <p>VeriSpend froze agent <strong>${args.agentId}</strong> at ${args.orgName}.</p>
+    <p><strong>Signal:</strong> ${args.signal.replaceAll("_", " ")}<br>
+       <strong>Reason:</strong> ${args.reason}</p>
+    <p>All further purchases by this agent are denied until you unfreeze it.</p>
+    <p><a href="${dashboardUrl}" style="background:#dc2626;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none">Review in dashboard</a></p>`;
+
+  try {
+    await env.EMAIL.send({
+      to: args.approverEmail,
+      from: { email: env.EMAIL_FROM, name: "VeriSpend Alerts" },
+      subject: `Circuit breaker: agent ${args.agentId} frozen (${args.signal.replaceAll("_", " ")})`,
+      text,
+      html,
+    });
+  } catch (error) {
+    // Alerts are best-effort: the freeze itself is already enforced.
+    console.log(
+      JSON.stringify({
+        event: "breaker_alert_email_failed",
+        error: error instanceof Error ? error.message : String(error),
+      })
+    );
+  }
+}
+
+export async function sendReconciliationAlertEmail(
+  env: Env,
+  args: {
+    approverEmail: string;
+    orgName: string;
+    vendor: string;
+    periodStart: string;
+    periodEnd: string;
+    billedCents: number;
+    expectedCents: number;
+    status: string;
+  }
+): Promise<void> {
+  const currency = "USD";
+  const variance = args.billedCents - args.expectedCents;
+  const text = [
+    `A ${args.vendor} bill at ${args.orgName} does not match recorded agent usage.`,
+    ``,
+    `Period:   ${args.periodStart} → ${args.periodEnd}`,
+    `Billed:   ${fmt(args.billedCents, currency)}`,
+    `Expected: ${fmt(args.expectedCents, currency)} (from agent usage records)`,
+    `Variance: ${fmt(variance, currency)} (${args.status.replaceAll("_", " ")})`,
+    ``,
+    `Review: ${env.BASE_URL}/dashboard/reconciliation`,
+  ].join("\n");
+
+  try {
+    await env.EMAIL.send({
+      to: args.approverEmail,
+      from: { email: env.EMAIL_FROM, name: "VeriSpend Alerts" },
+      subject: `Reconciliation flag: ${args.vendor} billed ${fmt(args.billedCents, currency)}, expected ${fmt(args.expectedCents, currency)}`,
+      text,
+    });
+  } catch (error) {
+    console.log(
+      JSON.stringify({
+        event: "reconciliation_alert_email_failed",
+        error: error instanceof Error ? error.message : String(error),
+      })
+    );
+  }
+}
+
 export type DecisionOutcome = {
   ok: boolean;
   title: string;

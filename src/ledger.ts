@@ -10,7 +10,12 @@ export type LedgerEventType =
   | "auto_decision"
   | "human_decision"
   | "outcome_recorded"
-  | "policy_updated";
+  | "policy_updated"
+  | "breaker_tripped"
+  | "breaker_reset"
+  | "usage_recorded"
+  | "bill_ingested"
+  | "bill_reconciled";
 
 export type LedgerAppend = {
   orgId: string;

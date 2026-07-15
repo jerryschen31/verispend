@@ -10,6 +10,11 @@
 4. After paying, the agent calls `record_outcome` — the final charge is recorded against the approval and budget counters are corrected.
 5. Every step is an append-only, hash-chained ledger event. The dashboard's Audit page re-verifies the whole chain on demand.
 
+Two Phase-1 safeguards run on top of that flow:
+
+- **Circuit breaker** — every `request_purchase` is pattern-checked (identical-request loops, request velocity, spend acceleration vs the agent's trailing baseline). A trip freezes the agent: all further purchases are denied, the approver is emailed, and a `breaker_tripped` event lands on the ledger. Unfreezing is one click in the dashboard. Thresholds are per-org policy (`circuitBreaker`), on by default.
+- **Metered-usage reconciliation** — agents report pay-per-use consumption with `record_usage` (it counts against budgets), finance enters the provider's bill on the Reconciliation page (or via API), and VeriSpend flags bills that don't match the recorded usage (`overbilled`, `underbilled`, `no_usage_data`; tolerance via policy `reconciliation`).
+
 ## MCP tools
 
 | Tool | Purpose |
@@ -17,7 +22,8 @@
 | `request_purchase` | Ask for authorization before paying |
 | `check_approval` | Poll a pending human decision |
 | `record_outcome` | Report the final charge after purchase |
-| `get_budget_status` | Remaining agent/org budgets |
+| `record_usage` | Report metered consumption (tokens, compute) after the fact |
+| `get_budget_status` | Remaining agent/org budgets + frozen state |
 
 Agents authenticate with a per-agent bearer key (`Authorization: Bearer vs_...`) against `https://<host>/mcp` (Streamable HTTP). Agent identity comes from the key — it can't be spoofed via tool arguments.
 
@@ -27,9 +33,20 @@ Agents authenticate with a per-agent bearer key (`Authorization: Bearer vs_...`)
 npm install
 npx wrangler d1 migrations apply verispend --local
 npm run dev          # http://localhost:8787
-npm test             # vitest (workers pool), 35 tests
+npm test             # vitest (workers pool)
 npm run check        # typecheck
+npm run simulate     # 4-agent demo/E2E against the dev server (see below)
 ```
+
+### Agent simulator
+
+With `npm run dev` running, `npm run simulate` provisions a fresh demo org and
+drives four agents through the real MCP endpoint: a well-behaved buyer, a
+runaway loop that trips the circuit breaker, a metered agent whose provider
+over-bills it, and a prompt-injected agent contained by the deny-list and the
+velocity breaker. It prints a narrated report and exits non-zero if any
+expectation fails. Pass `--approver you@example.com` to make the demo org's
+dashboard accessible to your login.
 
 Provision a local org (admin key is in `.dev.vars`):
 

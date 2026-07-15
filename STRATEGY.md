@@ -1,6 +1,6 @@
 # VeriSpend Strategy
 
-*Last updated: 2026-07-12*
+*Last updated: 2026-07-14*
 
 ## In one paragraph
 
@@ -96,6 +96,8 @@ This is not a concept deck. The core spine is built and running in production:
 - A **human approval flow** for purchases that cross a threshold, with one-click approve/deny.
 - A **tamper-evident ledger** that records every request, decision, and outcome, and can re-verify its own integrity on demand.
 - A **dashboard** for reviewing spending, approving requests, editing policy, and managing agent access.
+- The **Phase 1 circuit breaker**: every purchase request is pattern-checked for runaway-loop, velocity, and spend-acceleration signatures; a trip freezes the agent, denies all further spending, alerts the approver, and goes on the ledger. Unfreezing is a human decision in the dashboard.
+- **Phase 1 metered-usage reconciliation**: agents report pay-per-use consumption (`record_usage`, counted against budgets), provider bills are ingested via dashboard or API, and mismatches are flagged (over-billed, under-billed, or billed with no recorded usage at all).
 
 Everything below builds on this foundation.
 

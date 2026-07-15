@@ -6,12 +6,14 @@ import {
   getOrg,
   getPurchaseRequest,
   insertPurchaseRequest,
+  insertUsageRecord,
   markOutcomeRecorded,
 } from "./db";
-import { sendApprovalEmail } from "./approvals";
+import { sendApprovalEmail, sendBreakerAlertEmail } from "./approvals";
 import {
   evaluatePolicy,
   resolveAgentLimits,
+  resolveBreakerRules,
   resolveOrgLimits,
   type PurchaseIntent,
   type StaticDecision,
@@ -92,7 +94,34 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           justification,
         };
 
-        let decision: StaticDecision = evaluatePolicy(policy.rules, intent);
+        // Circuit breaker first: it sees every request (even ones policy
+        // would deny) and short-circuits everything once the agent is frozen.
+        const breaker = await org().recordAndCheck({
+          agentId,
+          vendor,
+          amountCents: amount_cents,
+          category,
+          breakerRules: resolveBreakerRules(policy.rules),
+        });
+
+        let decision: StaticDecision;
+        if (breaker.status === "frozen") {
+          decision = {
+            decision: "denied",
+            ruleFired: "agent_frozen",
+            reason:
+              `This agent is frozen by the circuit breaker (since ${breaker.frozenAt}): ` +
+              `${breaker.reason} A human must unfreeze it in the VeriSpend dashboard.`,
+          };
+        } else if (breaker.status === "tripped") {
+          decision = {
+            decision: "denied",
+            ruleFired: "circuit_breaker",
+            reason: `Circuit breaker tripped (${breaker.signal.replaceAll("_", " ")}): ${breaker.reason}`,
+          };
+        } else {
+          decision = evaluatePolicy(policy.rules, intent);
+        }
         if (decision.decision === "approved") {
           const reserve = await org().reserve({
             agentId,
@@ -173,6 +202,30 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
             approvalRef,
           },
         });
+
+        if (breaker.status === "tripped") {
+          await org().appendEvent({
+            orgId,
+            requestId,
+            eventType: "breaker_tripped",
+            payload: {
+              agentId,
+              signal: breaker.signal,
+              reason: breaker.reason,
+              config: resolveBreakerRules(policy.rules),
+            },
+          });
+          const orgRow = await getOrg(db, orgId);
+          if (orgRow?.approver_email) {
+            await sendBreakerAlertEmail(this.env, {
+              approverEmail: orgRow.approver_email,
+              orgName: orgRow.name,
+              agentId,
+              signal: breaker.signal,
+              reason: breaker.reason,
+            });
+          }
+        }
 
         return json({
           request_id: requestId,
@@ -284,6 +337,92 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
     );
 
     this.server.registerTool(
+      "record_usage",
+      {
+        description:
+          "Report metered consumption AFTER using a pay-per-use service (API " +
+          "tokens, compute, per-request fees). Call this after each batch of " +
+          "usage — e.g. once per task or every N calls. The expected cost " +
+          "counts against your budgets, and VeriSpend later reconciles the " +
+          "provider's actual bill against these records to catch over-charges.",
+        inputSchema: {
+          vendor: z.string().min(1).describe("Provider being consumed, e.g. OpenAI"),
+          metric: z
+            .string()
+            .min(1)
+            .describe("What was consumed, e.g. input_tokens, api_calls, gpu_hours"),
+          units: z.number().positive().describe("How many units were consumed"),
+          expected_cost_cents: z
+            .number()
+            .int()
+            .nonnegative()
+            .describe("Expected cost of this usage in cents, at the agreed pricing"),
+          note: z
+            .string()
+            .optional()
+            .describe("Optional context: task, model, pricing tier"),
+        },
+      },
+      async ({ vendor, metric, units, expected_cost_cents, note }) => {
+        const policy = await getActivePolicy(db, orgId);
+        if (!policy) return jsonError("No spend policy configured for this org.");
+
+        const usageId = `ur_${crypto.randomUUID()}`;
+        await insertUsageRecord(db, {
+          id: usageId,
+          org_id: orgId,
+          agent_id: agentId,
+          vendor,
+          metric,
+          units,
+          expected_cost_cents,
+          note: note ?? null,
+        });
+
+        // Usage already happened, so it can't be blocked — but it consumes
+        // budget headroom so future purchases and dashboards see it.
+        if (expected_cost_cents > 0) {
+          await org().adjust({ agentId, deltaCents: expected_cost_cents });
+        }
+        await org().appendEvent({
+          orgId,
+          requestId: usageId,
+          eventType: "usage_recorded",
+          payload: { agentId, vendor, metric, units, expectedCostCents: expected_cost_cents, note: note ?? null },
+        });
+
+        const usage = await org().usage({ agentId });
+        const agentLimits = resolveAgentLimits(policy.rules, agentId);
+        const orgLimits = resolveOrgLimits(policy.rules);
+        const overruns = [
+          agentLimits?.dailyCents !== undefined &&
+            usage.agentDailyCents > agentLimits.dailyCents &&
+            "agent daily budget exceeded",
+          agentLimits?.monthlyCents !== undefined &&
+            usage.agentMonthlyCents > agentLimits.monthlyCents &&
+            "agent monthly budget exceeded",
+          orgLimits?.dailyCents !== undefined &&
+            usage.orgDailyCents > orgLimits.dailyCents &&
+            "org daily budget exceeded",
+          orgLimits?.monthlyCents !== undefined &&
+            usage.orgMonthlyCents > orgLimits.monthlyCents &&
+            "org monthly budget exceeded",
+        ].filter((w): w is string => typeof w === "string");
+
+        return json({
+          usage_id: usageId,
+          recorded: { vendor, metric, units, expected_cost_cents },
+          agent_daily_used_cents: usage.agentDailyCents,
+          agent_daily_limit_cents: agentLimits?.dailyCents ?? null,
+          warning:
+            overruns.length > 0
+              ? `${overruns.join("; ")} — stop consuming and wait for guidance.`
+              : undefined,
+        });
+      }
+    );
+
+    this.server.registerTool(
       "get_budget_status",
       {
         description:
@@ -295,10 +434,13 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
         const policy = await getActivePolicy(db, orgId);
         if (!policy) return jsonError("No spend policy configured for this org.");
         const usage = await org().usage({ agentId });
+        const frozen = await org().isFrozen({ agentId });
         const agentLimits = resolveAgentLimits(policy.rules, agentId);
         const orgLimits = resolveOrgLimits(policy.rules);
         return json({
           agent_id: agentId,
+          frozen: frozen.frozen,
+          frozen_reason: frozen.reason,
           currency: policy.rules.currency,
           agent: {
             daily_used_cents: usage.agentDailyCents,
