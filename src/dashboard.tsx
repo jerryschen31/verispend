@@ -38,6 +38,14 @@ import {
 import { resolveTeamLimits } from "./policy";
 import { ingestBill } from "./reconcile";
 import { verifyLedgerChain } from "./ledger";
+import {
+  EXPORT_ROW_LIMIT,
+  buildAuditBundle,
+  exportBillsCsv,
+  exportLedgerEventsCsv,
+  exportPurchasesCsv,
+  exportUsageCsv,
+} from "./export";
 import type { FrozenAgentRow } from "./org-do";
 import type { PolicyRules } from "./policy";
 import {
@@ -105,6 +113,7 @@ const Layout = (props: { title: string; orgName?: string; children: Child }) => 
         <a href="/dashboard/keys">Agent Keys</a>
         <a href="/dashboard/teams">Teams</a>
         <a href="/dashboard/members">Members</a>
+        <a href="/dashboard/export">Export</a>
         <a href="/dashboard/audit">Audit</a>
         <span style="flex:1" />
         {props.orgName && <span class="muted">{props.orgName}</span>}
@@ -421,36 +430,115 @@ dashboard.get("/dashboard/ledger", async (c) => {
   );
 });
 
-dashboard.get("/dashboard/ledger.csv", async (c) => {
-  const rows = await listPurchaseRequests(c.env.DB, c.get("orgId"), {
-    limit: 10_000,
-  });
-  const esc = (v: unknown) => `"${String(v ?? "").replaceAll('"', '""')}"`;
-  const header =
-    "id,created_at,agent_id,vendor,amount_cents,currency,category,justification,status,rule_fired,denial_reason,approver,decided_at,outcome_amount_cents";
-  const lines = rows.map((r) =>
-    [
-      r.id,
-      r.created_at,
-      r.agent_id,
-      r.vendor,
-      r.amount_cents,
-      r.currency,
-      r.category,
-      r.justification,
-      r.status,
-      r.rule_fired,
-      r.denial_reason,
-      r.approver,
-      r.decided_at,
-      r.outcome_amount_cents,
-    ]
-      .map(esc)
-      .join(",")
+// Legacy export URL; the filtered exports live under /dashboard/export.
+dashboard.get("/dashboard/ledger.csv", (c) =>
+  c.redirect("/dashboard/export/purchases.csv")
+);
+
+// ---------- Exports ----------
+
+const csvHeaders = (filename: string) => ({
+  "content-type": "text/csv; charset=utf-8",
+  "content-disposition": `attachment; filename="${filename}"`,
+});
+
+const exportFilters = (c: {
+  req: { query: (k: string) => string | undefined };
+}) => ({
+  from: c.req.query("from") || undefined,
+  to: c.req.query("to") || undefined,
+  agentId: c.req.query("agent") || undefined,
+  status: c.req.query("status") || undefined,
+  teamId: c.req.query("team") || undefined,
+  vendor: c.req.query("vendor") || undefined,
+  eventType: c.req.query("type") || undefined,
+});
+
+dashboard.get("/dashboard/export", async (c) => {
+  const orgId = c.get("orgId");
+  const org = await getOrg(c.env.DB, orgId);
+  const teams = await listTeams(c.env.DB, orgId);
+  return c.html(
+    <Layout title="Export" orgName={org?.name}>
+      <h2>Audit exports</h2>
+      <p class="muted">
+        Filtered CSV exports of every record type (capped at{" "}
+        {EXPORT_ROW_LIMIT.toLocaleString()} rows), plus a self-verifiable JSON
+        audit bundle carrying the full hash chain and the recipe to re-verify
+        it without VeriSpend.
+      </p>
+      <form method="get" action="/dashboard/export/purchases.csv" style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1rem">
+        <label>From <input name="from" type="date" /></label>
+        <label>To <input name="to" type="date" /></label>
+        <input name="agent" placeholder="Agent id" />
+        <select name="status">
+          <option value="">All statuses</option>
+          {(["approved", "completed", "pending_approval", "denied"] as const).map((s) => (
+            <option value={s}>{s.replaceAll("_", " ")}</option>
+          ))}
+        </select>
+        <select name="team">
+          <option value="">All teams</option>
+          {teams.map((t) => (
+            <option value={t.id}>{t.name}</option>
+          ))}
+        </select>
+        <button class="btn" style="background:#0f172a">Purchases CSV</button>
+      </form>
+      <ul>
+        <li>
+          <a href="/dashboard/export/purchases.csv">purchases.csv</a>{" "}
+          <span class="muted">— filters: from, to, agent, status, team</span>
+        </li>
+        <li>
+          <a href="/dashboard/export/ledger-events.csv">ledger-events.csv</a>{" "}
+          <span class="muted">— the hash chain itself; filters: from, to, type</span>
+        </li>
+        <li>
+          <a href="/dashboard/export/usage.csv">usage.csv</a>{" "}
+          <span class="muted">— metered usage; filters: from, to, agent, vendor</span>
+        </li>
+        <li>
+          <a href="/dashboard/export/bills.csv">bills.csv</a>{" "}
+          <span class="muted">— reconciled bills; filters: from, to, vendor</span>
+        </li>
+        <li>
+          <a href="/dashboard/export/audit-bundle.json">audit-bundle.json</a>{" "}
+          <span class="muted">
+            — full chain + verification + policies; always unfiltered so it
+            can self-verify
+          </span>
+        </li>
+      </ul>
+    </Layout>
   );
-  return c.body([header, ...lines].join("\n"), 200, {
-    "content-type": "text/csv; charset=utf-8",
-    "content-disposition": 'attachment; filename="verispend-ledger.csv"',
+});
+
+dashboard.get("/dashboard/export/purchases.csv", async (c) => {
+  const csv = await exportPurchasesCsv(c.env.DB, c.get("orgId"), exportFilters(c));
+  return c.body(csv, 200, csvHeaders("verispend-purchases.csv"));
+});
+
+dashboard.get("/dashboard/export/ledger-events.csv", async (c) => {
+  const csv = await exportLedgerEventsCsv(c.env.DB, c.get("orgId"), exportFilters(c));
+  return c.body(csv, 200, csvHeaders("verispend-ledger-events.csv"));
+});
+
+dashboard.get("/dashboard/export/usage.csv", async (c) => {
+  const csv = await exportUsageCsv(c.env.DB, c.get("orgId"), exportFilters(c));
+  return c.body(csv, 200, csvHeaders("verispend-usage.csv"));
+});
+
+dashboard.get("/dashboard/export/bills.csv", async (c) => {
+  const csv = await exportBillsCsv(c.env.DB, c.get("orgId"), exportFilters(c));
+  return c.body(csv, 200, csvHeaders("verispend-bills.csv"));
+});
+
+dashboard.get("/dashboard/export/audit-bundle.json", async (c) => {
+  const bundle = await buildAuditBundle(c.env.DB, c.get("orgId"));
+  return c.body(JSON.stringify(bundle, null, 2), 200, {
+    "content-type": "application/json",
+    "content-disposition": 'attachment; filename="verispend-audit-bundle.json"',
   });
 });
 

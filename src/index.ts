@@ -17,6 +17,7 @@ import {
   type MemberRole,
 } from "./db";
 import type { BudgetLimits } from "./policy";
+import { buildAuditBundle, exportPurchasesCsv } from "./export";
 import { ingestBill } from "./reconcile";
 import { DEFAULT_POLICY, type PolicyRules } from "./policy";
 import { VeriSpendMCP } from "./mcp";
@@ -233,6 +234,37 @@ app.post("/api/admin/orgs/:orgId/bills", async (c) => {
     variance_cents: result.bill.variance_cents,
     recon_status: result.bill.recon_status,
   });
+});
+
+// Admin-key twins of the dashboard exports, for the simulator and CI (no
+// session machinery in Node). Same query params as the dashboard routes.
+app.get("/api/admin/orgs/:orgId/export/purchases.csv", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  if (!(await getOrg(c.env.DB, orgId))) {
+    return c.json({ error: "no such org" }, 404);
+  }
+  const csv = await exportPurchasesCsv(c.env.DB, orgId, {
+    from: c.req.query("from") || undefined,
+    to: c.req.query("to") || undefined,
+    agentId: c.req.query("agent") || undefined,
+    status: c.req.query("status") || undefined,
+    teamId: c.req.query("team") || undefined,
+  });
+  return c.body(csv, 200, { "content-type": "text/csv; charset=utf-8" });
+});
+
+app.get("/api/admin/orgs/:orgId/export/audit-bundle.json", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  if (!(await getOrg(c.env.DB, orgId))) {
+    return c.json({ error: "no such org" }, 404);
+  }
+  return c.json(await buildAuditBundle(c.env.DB, orgId));
 });
 
 export default {
