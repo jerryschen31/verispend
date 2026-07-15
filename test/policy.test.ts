@@ -31,7 +31,7 @@ const intent = (overrides: Partial<PurchaseIntent>): PurchaseIntent => ({
 
 describe("evaluatePolicy", () => {
   it("approves a purchase within all limits", () => {
-    expect(evaluatePolicy(rules, intent({}))).toEqual({
+    expect(evaluatePolicy(rules, intent({}))).toMatchObject({
       decision: "approved",
       ruleFired: "within_policy",
     });
@@ -116,6 +116,61 @@ describe("evaluatePolicy", () => {
     expect(
       evaluatePolicy(rules, intent({ amountCents: 199_99 })).decision
     ).toBe("approved");
+  });
+});
+
+describe("evaluatePolicy trace", () => {
+  const ALL_RULES = [
+    "invalid_amount",
+    "currency_mismatch",
+    "vendor_denied",
+    "vendor_not_allowed",
+    "category_denied",
+    "category_not_allowed",
+    "over_transaction_cap",
+    "escalation_category",
+    "escalation_amount",
+  ];
+
+  it("emits one entry per rule with nothing triggered on approval", () => {
+    const { trace } = evaluatePolicy(rules, intent({}));
+    expect(trace.map((t) => t.rule)).toEqual(ALL_RULES);
+    expect(trace.every((t) => t.result !== "triggered")).toBe(true);
+    // Rules the policy doesn't configure are marked so.
+    const vendorAllow = trace.find((t) => t.rule === "vendor_not_allowed");
+    expect(vendorAllow).toMatchObject({ result: "skipped", detail: "not configured" });
+    // Configured rules that were checked report why they passed.
+    const cap = trace.find((t) => t.rule === "over_transaction_cap");
+    expect(cap?.result).toBe("pass");
+    expect(cap?.detail).toContain("per-transaction cap");
+  });
+
+  it("shows pass → triggered → skipped ordering on a denial", () => {
+    const { trace, ruleFired } = evaluatePolicy(
+      rules,
+      intent({ vendor: "Shady Vendor Inc" })
+    );
+    const triggered = trace.find((t) => t.result === "triggered");
+    expect(triggered?.rule).toBe(ruleFired);
+    expect(triggered?.detail).toContain("deny list");
+
+    const idx = trace.findIndex((t) => t.result === "triggered");
+    expect(trace[1]).toMatchObject({ rule: "currency_mismatch", result: "pass" });
+    for (const later of trace.slice(idx + 1)) {
+      expect(later).toMatchObject({
+        result: "skipped",
+        detail: "skipped: decision already made",
+      });
+    }
+  });
+
+  it("records passing entries for every rule ahead of an escalation", () => {
+    const { trace } = evaluatePolicy(rules, intent({ amountCents: 250_00 }));
+    const triggered = trace.find((t) => t.result === "triggered");
+    expect(triggered?.rule).toBe("escalation_amount");
+    const before = trace.slice(0, trace.indexOf(triggered!));
+    expect(before.every((t) => t.result === "pass" || t.result === "skipped")).toBe(true);
+    expect(before.filter((t) => t.result === "pass").length).toBeGreaterThanOrEqual(4);
   });
 });
 

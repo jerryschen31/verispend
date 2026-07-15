@@ -15,8 +15,10 @@ import {
   getOrgByApproverEmail,
   insertPolicy,
   createTeam,
+  getPurchaseRequest,
   getTeam,
   listAgentKeys,
+  listLedgerEventsForRequest,
   listBilledCharges,
   listKnownAgentIds,
   listMembers,
@@ -136,7 +138,11 @@ const RequestTable = (props: {
     </tr>
     {props.rows.map((r) => (
       <tr>
-        <td>{r.created_at.slice(0, 16).replace("T", " ")}</td>
+        <td>
+          <a href={`/dashboard/requests/${r.id}`}>
+            {r.created_at.slice(0, 16).replace("T", " ")}
+          </a>
+        </td>
         <td>{r.agent_id}</td>
         <td>
           {r.vendor}
@@ -751,6 +757,99 @@ dashboard.post("/dashboard/keys/revoke", async (c) => {
   const form = await c.req.formData();
   await revokeAgentKey(c.env.DB, c.get("orgId"), String(form.get("key_id") ?? ""));
   return c.redirect("/dashboard/keys");
+});
+
+// ---------- Request detail (explainability) ----------
+
+const TRACE_COLORS: Record<string, string> = {
+  pass: "#16a34a",
+  triggered: "#dc2626",
+  skipped: "#6b7280",
+};
+
+const TraceTable = ({ trace }: { trace: Array<{ rule: string; result: string; detail?: string }> }) => (
+  <table style="margin-bottom:1rem">
+    <tr>
+      <th>Rule</th>
+      <th>Result</th>
+      <th>Detail</th>
+    </tr>
+    {trace.map((t) => (
+      <tr>
+        <td>
+          <code>{t.rule}</code>
+        </td>
+        <td>
+          <span class="pill" style={`background:${TRACE_COLORS[t.result] ?? "#6b7280"}`}>
+            {t.result}
+          </span>
+        </td>
+        <td class="muted">{t.detail ?? ""}</td>
+      </tr>
+    ))}
+  </table>
+);
+
+dashboard.get("/dashboard/requests/:id", async (c) => {
+  const orgId = c.get("orgId");
+  const row = await getPurchaseRequest(c.env.DB, orgId, c.req.param("id"));
+  if (!row) return c.text("No such request", 404);
+  const org = await getOrg(c.env.DB, orgId);
+  const events = await listLedgerEventsForRequest(c.env.DB, orgId, row.id);
+
+  return c.html(
+    <Layout title={`Request ${row.id}`} orgName={org?.name}>
+      <h2>
+        {row.vendor} — {fmt(row.amount_cents, row.currency)}{" "}
+        <StatusPill status={row.status} />
+      </h2>
+      <table style="margin-bottom:1.5rem">
+        <tr><th>Request</th><td><code>{row.id}</code></td></tr>
+        <tr><th>Agent</th><td>{row.agent_id}</td></tr>
+        <tr><th>Category</th><td>{row.category}</td></tr>
+        <tr><th>Justification</th><td>{row.justification}</td></tr>
+        <tr><th>Requested (UTC)</th><td>{row.created_at}</td></tr>
+        <tr><th>Rule fired</th><td><code>{row.rule_fired}</code></td></tr>
+        {row.denial_reason && (
+          <tr><th>Denial reason</th><td>{row.denial_reason}</td></tr>
+        )}
+        {row.approver && <tr><th>Decided by</th><td>{row.approver}</td></tr>}
+        {row.decided_at && <tr><th>Decided (UTC)</th><td>{row.decided_at}</td></tr>}
+        {row.outcome_amount_cents !== null && (
+          <tr><th>Final charge</th><td>{fmt(row.outcome_amount_cents, row.currency)}</td></tr>
+        )}
+      </table>
+
+      <h3>Ledger timeline</h3>
+      {events.map((e) => {
+        const payload = JSON.parse(e.payload_json) as Record<string, unknown>;
+        const trace = Array.isArray(payload.trace)
+          ? (payload.trace as Array<{ rule: string; result: string; detail?: string }>)
+          : null;
+        return (
+          <div style="margin-bottom:1.2rem">
+            <p style="margin-bottom:0.4rem">
+              <strong>{e.event_type.replaceAll("_", " ")}</strong>{" "}
+              <span class="muted">
+                #{e.seq} · {e.created_at.slice(0, 19).replace("T", " ")} UTC
+              </span>
+            </p>
+            {trace ? (
+              <TraceTable trace={trace} />
+            ) : (
+              <pre style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:6px;padding:0.6rem;font-size:0.8rem;overflow-x:auto">
+                {JSON.stringify(payload, null, 2)}
+              </pre>
+            )}
+          </div>
+        );
+      })}
+      <p class="muted">
+        Every event above is hash-chained on the tamper-evident ledger; the{" "}
+        <a href="/dashboard/audit">audit page</a> re-verifies the full chain.
+      </p>
+    </Layout>
+  );
 });
 
 // ---------- Teams ----------

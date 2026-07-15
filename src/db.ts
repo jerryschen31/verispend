@@ -651,6 +651,31 @@ export async function listBilledCharges(
   return results;
 }
 
+export type LedgerEventRow = {
+  seq: number;
+  org_id: string;
+  request_id: string;
+  event_type: string;
+  payload_json: string;
+  prev_hash: string;
+  hash: string;
+  created_at: string;
+};
+
+export async function listLedgerEventsForRequest(
+  db: D1Database,
+  orgId: string,
+  requestId: string
+): Promise<LedgerEventRow[]> {
+  const { results } = await db
+    .prepare(
+      "SELECT * FROM ledger_events WHERE org_id = ? AND request_id = ? ORDER BY seq ASC"
+    )
+    .bind(orgId, requestId)
+    .all<LedgerEventRow>();
+  return results;
+}
+
 export async function markOutcomeRecorded(
   db: D1Database,
   args: {

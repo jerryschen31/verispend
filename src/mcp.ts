@@ -18,9 +18,28 @@ import {
   resolveBreakerRules,
   resolveOrgLimits,
   resolveTeamLimits,
+  type EvaluatedDecision,
   type PurchaseIntent,
-  type StaticDecision,
+  type TraceEntry,
 } from "./policy";
+import type { BudgetCheck } from "./org-do";
+
+/** Budget checks rendered as trace entries, so approvals explain their math. */
+const budgetTrace = (
+  checks: BudgetCheck[],
+  failed?: { scope: string; period: string; reason: string }
+): TraceEntry[] =>
+  checks.map((c) => {
+    const rule = `budget_${c.scope}_${c.period}`;
+    if (failed && c.scope === failed.scope && c.period === failed.period) {
+      return { rule, result: "triggered", detail: failed.reason };
+    }
+    return {
+      rule,
+      result: "pass",
+      detail: `${c.scope} "${c.scopeId}" ${c.period}: ${c.usedCents}¢ used of ${c.limitCents}¢`,
+    };
+  });
 
 /** Human-readable name for the budget scope that rejected a reserve. */
 const scopeLabel = (
@@ -117,25 +136,36 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           breakerRules: resolveBreakerRules(policy.rules),
         });
 
-        let decision: StaticDecision;
+        let decision: EvaluatedDecision;
         if (breaker.status === "frozen") {
+          const reason =
+            `This agent is frozen by the circuit breaker (since ${breaker.frozenAt}): ` +
+            `${breaker.reason} A human must unfreeze it in the VeriSpend dashboard.`;
           decision = {
             decision: "denied",
             ruleFired: "agent_frozen",
-            reason:
-              `This agent is frozen by the circuit breaker (since ${breaker.frozenAt}): ` +
-              `${breaker.reason} A human must unfreeze it in the VeriSpend dashboard.`,
+            reason,
+            trace: [{ rule: "agent_frozen", result: "triggered", detail: reason }],
           };
         } else if (breaker.status === "tripped") {
+          const reason = `Circuit breaker tripped (${breaker.signal.replaceAll("_", " ")}): ${breaker.reason}`;
           decision = {
             decision: "denied",
             ruleFired: "circuit_breaker",
-            reason: `Circuit breaker tripped (${breaker.signal.replaceAll("_", " ")}): ${breaker.reason}`,
+            reason,
+            trace: [{ rule: "circuit_breaker", result: "triggered", detail: reason }],
           };
         } else {
           decision = evaluatePolicy(policy.rules, intent);
         }
         const team = await getTeamForAgent(db, orgId, agentId);
+        let budgetDenied: {
+          scope: string;
+          scope_id: string;
+          period: string;
+          limit_cents: number;
+          used_cents: number;
+        } | null = null;
         if (decision.decision === "approved") {
           const reserve = await org().reserve({
             agentId,
@@ -146,14 +176,32 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
             teamLimits: resolveTeamLimits(policy.rules, team?.id),
           });
           if (!reserve.ok) {
+            const reason =
+              `Budget exceeded (${scopeLabel(reserve.scope, reserve.period, team)}): ` +
+              `${reserve.usedCents}¢ of ${reserve.limitCents}¢ already used; ` +
+              `this purchase of ${amount_cents}¢ does not fit.`;
+            budgetDenied = {
+              scope: reserve.scope,
+              scope_id: reserve.scopeId,
+              period: reserve.period,
+              limit_cents: reserve.limitCents,
+              used_cents: reserve.usedCents,
+            };
             decision = {
               decision: "denied",
               ruleFired: `budget_${reserve.exceeded}`,
-              reason:
-                `Budget exceeded (${scopeLabel(reserve.scope, reserve.period, team)}): ` +
-                `${reserve.usedCents}¢ of ${reserve.limitCents}¢ already used; ` +
-                `this purchase of ${amount_cents}¢ does not fit.`,
+              reason,
+              trace: [
+                ...decision.trace,
+                ...budgetTrace(reserve.checks, {
+                  scope: reserve.scope,
+                  period: reserve.period,
+                  reason,
+                }),
+              ],
             };
+          } else {
+            decision.trace.push(...budgetTrace(reserve.checks));
           }
         }
 
@@ -216,6 +264,7 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
             reason: "reason" in decision ? decision.reason : null,
             policyVersion: policy.version,
             approvalRef,
+            trace: decision.trace,
           },
         });
 
@@ -248,6 +297,8 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           status: decision.decision,
           rule_fired: decision.ruleFired,
           reason: "reason" in decision ? decision.reason : undefined,
+          trace: decision.trace,
+          budget: budgetDenied ?? undefined,
           approval_ref: approvalRef ?? undefined,
           next_step:
             decision.decision === "approved"
