@@ -13,6 +13,19 @@ const fmt = (cents: number, currency: string) =>
     cents / 100
   );
 
+// Purchase fields (vendor, category, justification, agent id, breaker
+// reasons that quote them back) are agent-controlled and end up inside HTML
+// email bodies. Escape before interpolating so a malicious agent can't
+// inject markup into an approver's inbox.
+const ESCAPE_HTML_MAP: Record<string, string> = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
+const escapeHtml = (s: string) => s.replace(/[&<>"']/g, (c) => ESCAPE_HTML_MAP[c]);
+
 export async function sendApprovalEmail(
   env: Env,
   args: {
@@ -42,12 +55,12 @@ export async function sendApprovalEmail(
   ].join("\n");
 
   const html = `
-    <p>Agent <strong>${args.row.agent_id}</strong> at ${args.orgName} wants to make a purchase that needs your approval.</p>
+    <p>Agent <strong>${escapeHtml(args.row.agent_id)}</strong> at ${escapeHtml(args.orgName)} wants to make a purchase that needs your approval.</p>
     <table cellpadding="4">
-      <tr><td><strong>Vendor</strong></td><td>${args.row.vendor}</td></tr>
+      <tr><td><strong>Vendor</strong></td><td>${escapeHtml(args.row.vendor)}</td></tr>
       <tr><td><strong>Amount</strong></td><td>${amount}</td></tr>
-      <tr><td><strong>Category</strong></td><td>${args.row.category}</td></tr>
-      <tr><td><strong>Justification</strong></td><td>${args.row.justification}</td></tr>
+      <tr><td><strong>Category</strong></td><td>${escapeHtml(args.row.category)}</td></tr>
+      <tr><td><strong>Justification</strong></td><td>${escapeHtml(args.row.justification)}</td></tr>
     </table>
     <p>
       <a href="${approveUrl}" style="background:#16a34a;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none">Approve</a>
@@ -96,9 +109,9 @@ export async function sendBreakerAlertEmail(
   ].join("\n");
 
   const html = `
-    <p>VeriSpend froze agent <strong>${args.agentId}</strong> at ${args.orgName}.</p>
-    <p><strong>Signal:</strong> ${args.signal.replaceAll("_", " ")}<br>
-       <strong>Reason:</strong> ${args.reason}</p>
+    <p>VeriSpend froze agent <strong>${escapeHtml(args.agentId)}</strong> at ${escapeHtml(args.orgName)}.</p>
+    <p><strong>Signal:</strong> ${escapeHtml(args.signal.replaceAll("_", " "))}<br>
+       <strong>Reason:</strong> ${escapeHtml(args.reason)}</p>
     <p>All further purchases by this agent are denied until you unfreeze it.</p>
     <p><a href="${dashboardUrl}" style="background:#dc2626;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none">Review in dashboard</a></p>`;
 
@@ -132,9 +145,10 @@ export async function sendReconciliationAlertEmail(
     billedCents: number;
     expectedCents: number;
     status: string;
+    currency: string;
   }
 ): Promise<void> {
-  const currency = "USD";
+  const currency = args.currency;
   const variance = args.billedCents - args.expectedCents;
   const text = [
     `A ${args.vendor} bill at ${args.orgName} does not match recorded agent usage.`,

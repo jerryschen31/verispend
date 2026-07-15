@@ -143,6 +143,7 @@ export async function ingestBill(
         billedCents: args.amountCents,
         expectedCents,
         status,
+        currency: policy?.rules.currency ?? "USD",
       });
     }
   }
