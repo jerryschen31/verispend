@@ -367,6 +367,9 @@ async function decideRequestRow(
     status: "approved",
     approver,
     approvalRef,
+    // Pin the team the budget was just reserved against, so record_outcome
+    // corrects this team even if the agent is later reassigned.
+    teamId: team?.id ?? null,
   });
   await coordinator.appendEvent({
     orgId: row.org_id,

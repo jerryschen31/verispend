@@ -226,6 +226,59 @@ describe("shared team budgets end to end", () => {
     expect(check.status).toBe("approved");
   });
 
+  it("corrects an outcome on the reservation's team after the agent is reassigned", async () => {
+    const approver = "admin@reassign.test";
+    const org = await provisionOrg({
+      name: "Reassign Org",
+      agentId: "reassign-seed",
+      approverEmail: approver,
+      policy: POLICY,
+    });
+    const alpha = await adminPost(`/api/admin/orgs/${org.orgId}/teams`, {
+      name: "alpha",
+      agent_ids: ["mover"],
+      budgets: { dailyCents: 100_00 },
+    });
+    const beta = await adminPost(`/api/admin/orgs/${org.orgId}/teams`, {
+      name: "beta",
+      budgets: { dailyCents: 100_00 },
+    });
+    const agent = await mintAgent(org.orgId, "mover");
+
+    // Reserve $20 against team alpha (the agent's team at request time).
+    const approved = await buy(agent, 20_00, { vendor: "Reassign Vendor" });
+    expect(approved.status).toBe("approved");
+
+    // Reassign the agent to team beta before the outcome is recorded.
+    const cookie = await mintCookie(approver, org.orgId);
+    const move = await postForm(
+      `/dashboard/teams/${beta.body.team_id}/agents`,
+      cookie,
+      { agent_id: "mover", action: "add" }
+    );
+    expect(move.status).toBe(302);
+
+    // Final charge came in $5 under; the correction must land on alpha, not
+    // the agent's current team beta.
+    const outcome = await agent.call("record_outcome", {
+      request_id: approved.request_id,
+      final_amount_cents: 15_00,
+    });
+    expect(outcome.status).toBe("completed");
+
+    const coordinator = env.ORG.getByName(org.orgId);
+    const alphaUsage = await coordinator.usage({
+      agentId: "mover",
+      teamId: alpha.body.team_id,
+    });
+    const betaUsage = await coordinator.usage({
+      agentId: "mover",
+      teamId: beta.body.team_id,
+    });
+    expect(alphaUsage.teamDailyCents).toBe(15_00); // 20 reserved, corrected to 15
+    expect(betaUsage.teamDailyCents).toBe(0); // new team never touched
+  });
+
   it("gates team management to admins", async () => {
     const viewerEmail = "viewer@teams.test";
     await adminPost(`/api/admin/orgs/${orgId}/members`, {

@@ -27,6 +27,8 @@ export type PurchaseRequestRow = {
   decided_at: string | null;
   outcome_amount_cents: number | null;
   outcome_json: string | null;
+  /** Team whose shared budget this purchase was reserved against, if any. */
+  team_id: string | null;
   created_at: string;
 };
 
@@ -452,8 +454,8 @@ export async function insertPurchaseRequest(
       `INSERT INTO purchase_requests
          (id, org_id, agent_id, vendor, amount_cents, currency, category,
           justification, status, policy_version, rule_fired, denial_reason,
-          approval_ref, decided_at, decision_token)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          approval_ref, decided_at, decision_token, team_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       row.id,
@@ -470,7 +472,8 @@ export async function insertPurchaseRequest(
       row.denial_reason,
       row.approval_ref,
       row.decided_at,
-      row.decision_token ?? null
+      row.decision_token ?? null,
+      row.team_id ?? null
     )
     .run();
 }
@@ -518,13 +521,16 @@ export async function applyHumanDecision(
     approver: string;
     approvalRef?: string;
     denialReason?: string;
+    /** Team the approval reserved budget against; recorded so record_outcome
+     * corrects the right counter even after the agent is reassigned. */
+    teamId?: string | null;
   }
 ): Promise<void> {
   await db
     .prepare(
       `UPDATE purchase_requests
        SET status = ?, approver = ?, approval_ref = ?, denial_reason = ?,
-           decided_at = ?
+           decided_at = ?, team_id = ?
        WHERE org_id = ? AND id = ? AND status = 'pending_approval'`
     )
     .bind(
@@ -533,6 +539,7 @@ export async function applyHumanDecision(
       args.approvalRef ?? null,
       args.denialReason ?? null,
       new Date().toISOString(),
+      args.teamId ?? null,
       args.orgId,
       args.requestId
     )

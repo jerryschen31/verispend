@@ -231,6 +231,10 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           approval_ref: approvalRef,
           decided_at: decidedNow ? new Date().toISOString() : null,
           decision_token: null, // per-recipient tokens live in decision_tokens
+          // Pin the team the budget was reserved against so a later outcome
+          // corrects the right counter. Pending reservations happen at
+          // approval time, so their team is recorded there instead.
+          team_id: decision.decision === "approved" ? team?.id ?? null : null,
         });
 
         let routed: { emails: string[]; source: string } | null = null;
@@ -394,8 +398,14 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
 
         const deltaCents = final_amount_cents - row.amount_cents;
         if (deltaCents !== 0) {
-          const team = await getTeamForAgent(db, orgId, row.agent_id);
-          await org().adjust({ agentId: row.agent_id, deltaCents, teamId: team?.id });
+          // Correct the counter on the team the reservation actually hit
+          // (persisted at decision time), not the agent's current team — the
+          // agent may have been reassigned since.
+          await org().adjust({
+            agentId: row.agent_id,
+            deltaCents,
+            teamId: row.team_id ?? undefined,
+          });
         }
 
         const outcomeJson = receipt ? JSON.stringify({ receipt }) : null;
