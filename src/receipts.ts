@@ -66,7 +66,10 @@ function parseSigningJwk(env: Env): JsonWebKey {
   if (!env.RECEIPT_SIGNING_KEY) {
     throw new Error("RECEIPT_SIGNING_KEY secret is not configured");
   }
-  return JSON.parse(env.RECEIPT_SIGNING_KEY) as JsonWebKey;
+  // Keep only the required members; a full Node keygen export carries
+  // optional fields (alg, key_ops) that workerd's importKey rejects.
+  const raw = JSON.parse(env.RECEIPT_SIGNING_KEY) as JsonWebKey;
+  return { kty: raw.kty, crv: raw.crv, x: raw.x, d: raw.d };
 }
 
 export type IssueReceiptResult =

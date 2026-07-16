@@ -254,6 +254,30 @@ describe("verifyMandate against the trusted-issuer registry", () => {
     });
   });
 
+  it("accepts a JWK registered with optional fields (Node-style full export)", async () => {
+    // Node's exportKey emits alg "Ed25519" / key_ops / ext, which some
+    // runtimes reject at importKey; registration must tolerate a full paste.
+    const keys = await generateIssuerKeypair("Ed25519");
+    await insertMandateIssuer(env.DB, {
+      orgId,
+      issuer: `${ISSUER}/fulljwk`,
+      scheme: "ap2",
+      alg: "Ed25519",
+      publicKeyJwk: JSON.stringify({
+        ...keys.publicJwk,
+        alg: "Ed25519",
+        key_ops: ["verify"],
+        ext: true,
+      }),
+    });
+    const token = await mintMandate(
+      keys.privateJwk,
+      "Ed25519",
+      ap2Claims({ iss: `${ISSUER}/fulljwk`, sub: "agent-1", vendors: ["Figma"] })
+    );
+    expect((await verifyMandate(env.DB, orgId, token, INTENT)).ok).toBe(true);
+  });
+
   it("rejects mandates from a revoked issuer, then accepts after re-registration", async () => {
     const keys = await generateIssuerKeypair("Ed25519");
     const { issuerId } = await registerIssuer(orgId, keys, { issuer: `${ISSUER}/rev` });

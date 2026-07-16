@@ -217,7 +217,14 @@ async function verifySignature(
   // The algorithm is pinned on the issuer registration, never read from the
   // JWS header — a forged header can't downgrade or confuse verification.
   try {
-    const jwk = JSON.parse(issuer.public_key_jwk) as JsonWebKey;
+    // Keep only the JWK's required members: runtimes disagree on optional
+    // fields (Node exports alg "Ed25519", workerd expects "EdDSA"), and a
+    // registrant pasting a full export must not break verification.
+    const raw = JSON.parse(issuer.public_key_jwk) as JsonWebKey;
+    const jwk: JsonWebKey =
+      issuer.alg === "Ed25519"
+        ? { kty: raw.kty, crv: raw.crv, x: raw.x }
+        : { kty: raw.kty, crv: raw.crv, x: raw.x, y: raw.y };
     if (issuer.alg === "Ed25519") {
       const key = await crypto.subtle.importKey("jwk", jwk, { name: "Ed25519" }, false, [
         "verify",

@@ -98,6 +98,9 @@ This is not a concept deck. The core spine is built and running in production:
 - A **dashboard** for reviewing spending, approving requests, editing policy, and managing agent access.
 - The **Phase 1 circuit breaker**: every purchase request is pattern-checked for runaway-loop, velocity, and spend-acceleration signatures; a trip freezes the agent, denies all further spending, alerts the approver, and goes on the ledger. Unfreezing is a human decision in the dashboard.
 - **Phase 1 metered-usage reconciliation**: agents report pay-per-use consumption (`record_usage`, counted against budgets), provider bills are ingested via dashboard or API, and mismatches are flagged (over-billed, under-billed, or billed with no recorded usage at all).
+- **Phase 3 mandate consumption**: agents present network-issued, signed mandate credentials with a purchase; VeriSpend verifies them locally against a per-org registry of trusted issuer public keys (registering a network's published key is the entire integration), enforces the mandate's scope, and can require mandates by policy.
+- **Phase 3 cross-rail settlement matching**: settlement confirmations from any rail are pushed to VeriSpend and matched to the purchase that authorized them — exact reference first, then heuristics — flagging over-charges and charges no agent ever requested.
+- **Phase 3 verifiable receipts**: any decided purchase can be attested with an Ed25519-signed receipt covering intent → authorization → charge → settlement match, anchored into the hash-chained ledger and verifiable offline by a third party with no VeriSpend code.
 
 Everything below builds on this foundation.
 
