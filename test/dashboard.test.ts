@@ -311,3 +311,190 @@ describe("dashboard", () => {
     expect(html).toContain("Hash chain verified");
   });
 });
+
+describe("phase 3 pages: settlements, issuers, receipts", () => {
+  let viewerCookie: string;
+
+  beforeAll(async () => {
+    await SELF.fetch(`http://example.com/api/admin/orgs/${orgId}/members`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-admin-key": "test-admin-key",
+      },
+      body: JSON.stringify({ email: "viewer@example.com", role: "viewer" }),
+    });
+    viewerCookie = `${SESSION_COOKIE}=${await signToken("test-session-secret", {
+      purpose: "session",
+      email: "viewer@example.com",
+      orgId,
+      exp: Date.now() + SESSION_TTL_MS,
+    })}`;
+  });
+
+  it("ingests a settlement from the form and renders the match", async () => {
+    const res = await postForm("/dashboard/settlements", {
+      rail: "card",
+      settlement_ref: "AUTH-DASH",
+      vendor: "Rogue Dashboard Vendor",
+      amount_cents: "4200",
+      currency: "USD",
+      occurred_at: "2026-07-15T10:00",
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/dashboard/settlements");
+
+    const html = await (await get("/dashboard/settlements")).text();
+    expect(html).toContain("AUTH-DASH");
+    expect(html).toContain("Rogue Dashboard Vendor");
+    expect(html).toContain("unauthorized");
+
+    // Invalid input round-trips as an error message, not a 500.
+    const bad = await postForm("/dashboard/settlements", {
+      rail: "card",
+      settlement_ref: "",
+      vendor: "X",
+      amount_cents: "100",
+      occurred_at: "2026-07-15T10:00",
+    });
+    expect(bad.headers.get("location")).toContain("error=");
+  });
+
+  it("keeps viewers read-only on settlements", async () => {
+    const page = await SELF.fetch("http://example.com/dashboard/settlements", {
+      headers: { cookie: viewerCookie },
+    });
+    expect(page.status).toBe(200);
+
+    const post = await SELF.fetch("http://example.com/dashboard/settlements", {
+      method: "POST",
+      headers: {
+        cookie: viewerCookie,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ rail: "card" }).toString(),
+    });
+    expect(post.status).toBe(403);
+  });
+
+  it("registers and revokes a trusted issuer (admin only)", async () => {
+    const register = await postForm("/dashboard/issuers", {
+      issuer: "https://dash-issuer.test",
+      scheme: "ap2",
+      alg: "Ed25519",
+      public_key_jwk: JSON.stringify({
+        kty: "OKP",
+        crv: "Ed25519",
+        x: "SDZ-jN-bJlQ6miAQfnvK62RvyJ4griojJEUkASJJW1I",
+      }),
+    });
+    expect(register.status).toBe(302);
+
+    let html = await (await get("/dashboard/issuers")).text();
+    expect(html).toContain("https://dash-issuer.test");
+    expect(html).toContain("active");
+
+    const issuerId = html.match(/name="issuer_id" value="(iss_[^"]+)"/)?.[1];
+    expect(issuerId).toBeTruthy();
+    const revoke = await postForm("/dashboard/issuers/revoke", {
+      issuer_id: issuerId!,
+    });
+    expect(revoke.status).toBe(302);
+    html = await (await get("/dashboard/issuers")).text();
+    expect(html).toContain("revoked");
+
+    // Bad JWK round-trips as an error; non-admins are forbidden.
+    const bad = await postForm("/dashboard/issuers", {
+      issuer: "x",
+      scheme: "ap2",
+      alg: "Ed25519",
+      public_key_jwk: "not json",
+    });
+    expect(bad.headers.get("location")).toContain("error=");
+    const forbidden = await SELF.fetch("http://example.com/dashboard/issuers", {
+      method: "POST",
+      headers: {
+        cookie: viewerCookie,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ issuer: "x" }).toString(),
+    });
+    expect(forbidden.status).toBe(403);
+  });
+
+  it("issues a receipt from the request detail page and serves the download", async () => {
+    const session = new McpSession(apiKey);
+    expect(await session.initialize()).toBe(200);
+    const purchase = await session.call("request_purchase", {
+      vendor: "Receipt Dash Vendor",
+      amount_cents: 12_00,
+      currency: "USD",
+      category: "software",
+      justification: "dashboard receipt test",
+    });
+    expect(purchase.status).toBe("approved");
+
+    let html = await (await get(`/dashboard/requests/${purchase.request_id}`)).text();
+    expect(html).toContain("No receipt issued yet");
+    expect(html).toContain("Issue signed receipt");
+
+    const issue = await postForm(`/dashboard/requests/${purchase.request_id}/receipt`, {});
+    expect(issue.status).toBe(302);
+
+    html = await (await get(`/dashboard/requests/${purchase.request_id}`)).text();
+    expect(html).toContain("Reissue signed receipt");
+    expect(html).toContain("download");
+
+    const download = await get(
+      `/dashboard/requests/${purchase.request_id}/receipt.json`
+    );
+    expect(download.status).toBe(200);
+    const receipt = await download.json<{
+      format: string;
+      payload_json: string;
+    }>();
+    expect(receipt.format).toBe("verispend-receipt");
+    expect(JSON.parse(receipt.payload_json).request.vendor).toBe(
+      "Receipt Dash Vendor"
+    );
+
+    // Viewers can read but not issue.
+    const forbidden = await SELF.fetch(
+      `http://example.com/dashboard/requests/${purchase.request_id}/receipt`,
+      { method: "POST", headers: { cookie: viewerCookie } }
+    );
+    expect(forbidden.status).toBe(403);
+  });
+
+  it("shows mandate and settlement panels on the request detail page", async () => {
+    const session = new McpSession(apiKey);
+    expect(await session.initialize()).toBe(200);
+    const purchase = await session.call("request_purchase", {
+      vendor: "Panel Vendor",
+      amount_cents: 18_00,
+      currency: "USD",
+      category: "software",
+      justification: "panel test",
+    });
+    await session.call("record_outcome", {
+      request_id: purchase.request_id,
+      final_amount_cents: 18_00,
+      rail: "card",
+      settlement_ref: "AUTH-PANEL",
+    });
+    await postForm("/dashboard/settlements", {
+      rail: "card",
+      settlement_ref: "AUTH-PANEL",
+      vendor: "Panel Vendor",
+      amount_cents: "1800",
+      currency: "USD",
+      occurred_at: "2026-07-15T10:00",
+    });
+
+    const html = await (await get(`/dashboard/requests/${purchase.request_id}`)).text();
+    expect(html).toContain("Settlement");
+    expect(html).toContain("AUTH-PANEL");
+    expect(html).toContain("matched");
+    expect(html).toContain("Reported settlement");
+  });
+});

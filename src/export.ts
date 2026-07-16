@@ -135,6 +135,31 @@ export async function exportBillsCsv(
   return toCsv(cols, results.map((r) => cols.map((c) => r[c])));
 }
 
+export async function exportSettlementsCsv(
+  db: D1Database,
+  orgId: string,
+  f: DateRange & { rail?: string; matchStatus?: string }
+): Promise<string> {
+  const { where, bindings } = buildWhere(orgId, [
+    ...dateFilters(f),
+    { clause: "rail = ?", binding: f.rail },
+    { clause: "match_status = ?", binding: f.matchStatus },
+  ]);
+  const { results } = await db
+    .prepare(
+      `SELECT * FROM settlements WHERE ${where}
+       ORDER BY created_at, id LIMIT ${EXPORT_ROW_LIMIT}`
+    )
+    .bind(...bindings)
+    .all<Record<string, unknown>>();
+  const cols = [
+    "id", "created_at", "rail", "settlement_ref", "vendor", "amount_cents",
+    "currency", "occurred_at", "match_status", "match_method",
+    "matched_request_id", "variance_cents", "entered_by",
+  ];
+  return toCsv(cols, results.map((r) => cols.map((c) => r[c])));
+}
+
 export type AuditBundle = {
   format: "verispend-audit-bundle";
   version: 1;

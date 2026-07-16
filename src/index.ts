@@ -19,7 +19,11 @@ import {
   type MemberRole,
 } from "./db";
 import type { BudgetLimits } from "./policy";
-import { buildAuditBundle, exportPurchasesCsv } from "./export";
+import {
+  buildAuditBundle,
+  exportPurchasesCsv,
+  exportSettlementsCsv,
+} from "./export";
 import { ingestBill } from "./reconcile";
 import { ingestSettlement } from "./settlements";
 import { issueReceipt, listReceiptKeys } from "./receipts";
@@ -396,6 +400,23 @@ app.get("/api/admin/orgs/:orgId/export/purchases.csv", async (c) => {
     agentId: c.req.query("agent") || undefined,
     status: c.req.query("status") || undefined,
     teamId: c.req.query("team") || undefined,
+  });
+  return c.body(csv, 200, { "content-type": "text/csv; charset=utf-8" });
+});
+
+app.get("/api/admin/orgs/:orgId/export/settlements.csv", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  if (!(await getOrg(c.env.DB, orgId))) {
+    return c.json({ error: "no such org" }, 404);
+  }
+  const csv = await exportSettlementsCsv(c.env.DB, orgId, {
+    from: c.req.query("from") || undefined,
+    to: c.req.query("to") || undefined,
+    rail: c.req.query("rail") || undefined,
+    matchStatus: c.req.query("match") || undefined,
   });
   return c.body(csv, 200, { "content-type": "text/csv; charset=utf-8" });
 });

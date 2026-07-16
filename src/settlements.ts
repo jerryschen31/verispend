@@ -137,7 +137,17 @@ export function normalizeSettlement(
   if (!(SETTLEMENT_RAILS as readonly string[]).includes(rail)) {
     return { ok: false, error: `rail must be one of: ${SETTLEMENT_RAILS.join(", ")}` };
   }
-  const fields = adaptRail(rail as SettlementRail, payload);
+  // Rail-native field names win; the normalized names ("other" shape) are
+  // accepted on any rail so manual entry (the dashboard form) stays one form.
+  const specific = adaptRail(rail as SettlementRail, payload);
+  const generic = adaptRail("other", payload);
+  const fields: RawFields = {
+    settlementRef: specific.settlementRef ?? generic.settlementRef,
+    vendor: specific.vendor ?? generic.vendor,
+    amountCents: specific.amountCents ?? generic.amountCents,
+    currency: specific.currency ?? generic.currency,
+    occurredAt: specific.occurredAt ?? generic.occurredAt,
+  };
   if (!fields.settlementRef) {
     return { ok: false, error: `missing the ${rail} rail's settlement reference` };
   }
