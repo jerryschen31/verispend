@@ -29,6 +29,9 @@ export type PurchaseRequestRow = {
   outcome_json: string | null;
   /** Team whose shared budget this purchase was reserved against, if any. */
   team_id: string | null;
+  /** Rail and rail-native reference the agent reported at record_outcome. */
+  settlement_rail: string | null;
+  settlement_ref: string | null;
   created_at: string;
 };
 
@@ -446,7 +449,12 @@ export async function insertPurchaseRequest(
   db: D1Database,
   row: Omit<
     PurchaseRequestRow,
-    "created_at" | "outcome_amount_cents" | "outcome_json" | "approver"
+    | "created_at"
+    | "outcome_amount_cents"
+    | "outcome_json"
+    | "approver"
+    | "settlement_rail"
+    | "settlement_ref"
   > & { decision_token?: string | null }
 ): Promise<void> {
   await db
@@ -682,6 +690,150 @@ export async function listBilledCharges(
   return results;
 }
 
+// ---------- Payment mandates (Phase 3: externally issued credentials) ----------
+
+export type MandateIssuerRow = {
+  id: string;
+  org_id: string;
+  issuer: string;
+  scheme: string;
+  alg: string;
+  public_key_jwk: string;
+  created_at: string;
+  revoked_at: string | null;
+};
+
+/** Registering an issuer that already exists replaces its key (rotation). */
+export async function insertMandateIssuer(
+  db: D1Database,
+  args: {
+    orgId: string;
+    issuer: string;
+    scheme: string;
+    alg: string;
+    publicKeyJwk: string;
+  }
+): Promise<{ issuerId: string }> {
+  const id = `iss_${crypto.randomUUID()}`;
+  await db
+    .prepare(
+      `INSERT INTO mandate_issuers (id, org_id, issuer, scheme, alg, public_key_jwk)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT (org_id, issuer) DO UPDATE SET
+         scheme = excluded.scheme, alg = excluded.alg,
+         public_key_jwk = excluded.public_key_jwk, revoked_at = NULL`
+    )
+    .bind(id, args.orgId, args.issuer.trim(), args.scheme, args.alg, args.publicKeyJwk)
+    .run();
+  const row = await db
+    .prepare("SELECT id FROM mandate_issuers WHERE org_id = ? AND issuer = ?")
+    .bind(args.orgId, args.issuer.trim())
+    .first<{ id: string }>();
+  return { issuerId: row?.id ?? id };
+}
+
+export async function listMandateIssuers(
+  db: D1Database,
+  orgId: string
+): Promise<MandateIssuerRow[]> {
+  const { results } = await db
+    .prepare(
+      "SELECT * FROM mandate_issuers WHERE org_id = ? ORDER BY created_at, issuer"
+    )
+    .bind(orgId)
+    .all<MandateIssuerRow>();
+  return results;
+}
+
+/** Active (non-revoked) issuer registration for an "iss" claim, if any. */
+export async function getMandateIssuer(
+  db: D1Database,
+  orgId: string,
+  issuer: string
+): Promise<MandateIssuerRow | null> {
+  return db
+    .prepare(
+      "SELECT * FROM mandate_issuers WHERE org_id = ? AND issuer = ? AND revoked_at IS NULL"
+    )
+    .bind(orgId, issuer.trim())
+    .first<MandateIssuerRow>();
+}
+
+export async function revokeMandateIssuer(
+  db: D1Database,
+  orgId: string,
+  issuerId: string
+): Promise<void> {
+  await db
+    .prepare(
+      "UPDATE mandate_issuers SET revoked_at = ? WHERE org_id = ? AND id = ? AND revoked_at IS NULL"
+    )
+    .bind(new Date().toISOString(), orgId, issuerId)
+    .run();
+}
+
+export type PaymentMandateRow = {
+  id: string;
+  org_id: string;
+  request_id: string;
+  issuer_id: string | null;
+  scheme: string;
+  issuer: string;
+  subject: string;
+  mandate_ref: string;
+  scope_json: string;
+  not_before: string | null;
+  expires_at: string | null;
+  token_hash: string;
+  raw_token: string;
+  verification_status: string;
+  created_at: string;
+};
+
+export async function insertPaymentMandate(
+  db: D1Database,
+  row: Omit<PaymentMandateRow, "created_at">
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO payment_mandates
+         (id, org_id, request_id, issuer_id, scheme, issuer, subject, mandate_ref,
+          scope_json, not_before, expires_at, token_hash, raw_token, verification_status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      row.id,
+      row.org_id,
+      row.request_id,
+      row.issuer_id,
+      row.scheme,
+      row.issuer,
+      row.subject,
+      row.mandate_ref,
+      row.scope_json,
+      row.not_before,
+      row.expires_at,
+      row.token_hash,
+      row.raw_token,
+      row.verification_status
+    )
+    .run();
+}
+
+export async function getMandateForRequest(
+  db: D1Database,
+  orgId: string,
+  requestId: string
+): Promise<PaymentMandateRow | null> {
+  return db
+    .prepare(
+      `SELECT * FROM payment_mandates WHERE org_id = ? AND request_id = ?
+       ORDER BY created_at DESC, id DESC LIMIT 1`
+    )
+    .bind(orgId, requestId)
+    .first<PaymentMandateRow>();
+}
+
 export type LedgerEventRow = {
   seq: number;
   org_id: string;
@@ -714,14 +866,268 @@ export async function markOutcomeRecorded(
     requestId: string;
     outcomeAmountCents: number;
     outcomeJson: string | null;
+    settlementRail?: string | null;
+    settlementRef?: string | null;
   }
 ): Promise<void> {
   await db
     .prepare(
       `UPDATE purchase_requests
-       SET status = 'completed', outcome_amount_cents = ?, outcome_json = ?
+       SET status = 'completed', outcome_amount_cents = ?, outcome_json = ?,
+           settlement_rail = ?, settlement_ref = ?
        WHERE org_id = ? AND id = ? AND status = 'approved'`
     )
-    .bind(args.outcomeAmountCents, args.outcomeJson, args.orgId, args.requestId)
+    .bind(
+      args.outcomeAmountCents,
+      args.outcomeJson,
+      args.settlementRail ?? null,
+      args.settlementRef ?? null,
+      args.orgId,
+      args.requestId
+    )
     .run();
+}
+
+// ---------- Settlements (Phase 3: cross-rail charge confirmations) ----------
+
+export type SettlementRow = {
+  id: string;
+  org_id: string;
+  rail: string;
+  settlement_ref: string;
+  vendor: string;
+  amount_cents: number;
+  currency: string;
+  occurred_at: string;
+  raw_json: string;
+  match_status: string;
+  match_method: string;
+  matched_request_id: string | null;
+  variance_cents: number;
+  entered_by: string;
+  created_at: string;
+};
+
+export async function insertSettlement(
+  db: D1Database,
+  row: Omit<SettlementRow, "created_at">
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO settlements
+         (id, org_id, rail, settlement_ref, vendor, amount_cents, currency,
+          occurred_at, raw_json, match_status, match_method, matched_request_id,
+          variance_cents, entered_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      row.id,
+      row.org_id,
+      row.rail,
+      row.settlement_ref,
+      row.vendor,
+      row.amount_cents,
+      row.currency,
+      row.occurred_at,
+      row.raw_json,
+      row.match_status,
+      row.match_method,
+      row.matched_request_id,
+      row.variance_cents,
+      row.entered_by
+    )
+    .run();
+}
+
+export async function getSettlementByRef(
+  db: D1Database,
+  orgId: string,
+  rail: string,
+  settlementRef: string
+): Promise<SettlementRow | null> {
+  return db
+    .prepare(
+      "SELECT * FROM settlements WHERE org_id = ? AND rail = ? AND settlement_ref = ?"
+    )
+    .bind(orgId, rail, settlementRef)
+    .first<SettlementRow>();
+}
+
+export async function listSettlements(
+  db: D1Database,
+  orgId: string,
+  limit = 100
+): Promise<SettlementRow[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT * FROM settlements WHERE org_id = ?
+       ORDER BY created_at DESC, id DESC LIMIT ?`
+    )
+    .bind(orgId, limit)
+    .all<SettlementRow>();
+  return results;
+}
+
+export async function listSettlementsForRequest(
+  db: D1Database,
+  orgId: string,
+  requestId: string
+): Promise<SettlementRow[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT * FROM settlements WHERE org_id = ? AND matched_request_id = ?
+       ORDER BY created_at ASC`
+    )
+    .bind(orgId, requestId)
+    .all<SettlementRow>();
+  return results;
+}
+
+/** Re-point a settlement after a late record_outcome supplies its ref. */
+export async function updateSettlementMatch(
+  db: D1Database,
+  args: {
+    orgId: string;
+    settlementId: string;
+    matchStatus: string;
+    matchMethod: string;
+    matchedRequestId: string | null;
+    varianceCents: number;
+  }
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE settlements
+       SET match_status = ?, match_method = ?, matched_request_id = ?, variance_cents = ?
+       WHERE org_id = ? AND id = ?`
+    )
+    .bind(
+      args.matchStatus,
+      args.matchMethod,
+      args.matchedRequestId,
+      args.varianceCents,
+      args.orgId,
+      args.settlementId
+    )
+    .run();
+}
+
+// ---------- Receipts (Phase 3: signed dispute evidence) ----------
+
+export type ReceiptRow = {
+  id: string;
+  org_id: string;
+  request_id: string;
+  key_id: string;
+  payload_hash: string;
+  receipt_json: string;
+  issued_by: string;
+  created_at: string;
+};
+
+export async function insertReceipt(
+  db: D1Database,
+  row: Omit<ReceiptRow, "created_at">
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO receipts
+         (id, org_id, request_id, key_id, payload_hash, receipt_json, issued_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      row.id,
+      row.org_id,
+      row.request_id,
+      row.key_id,
+      row.payload_hash,
+      row.receipt_json,
+      row.issued_by
+    )
+    .run();
+}
+
+export async function getLatestReceipt(
+  db: D1Database,
+  orgId: string,
+  requestId: string
+): Promise<ReceiptRow | null> {
+  return db
+    .prepare(
+      // created_at is second-granular; rowid breaks ties in insertion order.
+      `SELECT * FROM receipts WHERE org_id = ? AND request_id = ?
+       ORDER BY created_at DESC, rowid DESC LIMIT 1`
+    )
+    .bind(orgId, requestId)
+    .first<ReceiptRow>();
+}
+
+/** The org's ledger chain tail — what a receipt anchors itself to. */
+export async function getLedgerChainHead(
+  db: D1Database,
+  orgId: string
+): Promise<{ seq: number; hash: string } | null> {
+  return db
+    .prepare(
+      "SELECT seq, hash FROM ledger_events WHERE org_id = ? ORDER BY seq DESC LIMIT 1"
+    )
+    .bind(orgId)
+    .first<{ seq: number; hash: string }>();
+}
+
+export async function getRequestBySettlementRef(
+  db: D1Database,
+  orgId: string,
+  settlementRef: string
+): Promise<PurchaseRequestRow | null> {
+  return db
+    .prepare(
+      `SELECT * FROM purchase_requests
+       WHERE org_id = ? AND settlement_ref = ? AND status IN ('approved', 'completed')
+       ORDER BY created_at ASC LIMIT 1`
+    )
+    .bind(orgId, settlementRef)
+    .first<PurchaseRequestRow>();
+}
+
+export async function getRequestByApprovalRef(
+  db: D1Database,
+  orgId: string,
+  approvalRef: string
+): Promise<PurchaseRequestRow | null> {
+  return db
+    .prepare(
+      `SELECT * FROM purchase_requests
+       WHERE org_id = ? AND approval_ref = ? AND status IN ('approved', 'completed')`
+    )
+    .bind(orgId, approvalRef)
+    .first<PurchaseRequestRow>();
+}
+
+/**
+ * Approved/completed purchases from this vendor not yet claimed by any
+ * settlement, oldest first (created_at is second-granular, so rowid breaks
+ * ties in true insertion order). Amount tolerance and the time window are
+ * applied by the caller (per-row math is clearer in TS than SQL).
+ */
+export async function findHeuristicMatchCandidates(
+  db: D1Database,
+  orgId: string,
+  vendor: string,
+  limit = 50
+): Promise<PurchaseRequestRow[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT pr.* FROM purchase_requests pr
+       WHERE pr.org_id = ? AND LOWER(TRIM(pr.vendor)) = LOWER(TRIM(?))
+         AND pr.status IN ('approved', 'completed')
+         AND NOT EXISTS (
+           SELECT 1 FROM settlements s
+           WHERE s.org_id = pr.org_id AND s.matched_request_id = pr.id
+         )
+       ORDER BY pr.created_at ASC, pr.rowid ASC LIMIT ?`
+    )
+    .bind(orgId, vendor, limit)
+    .all<PurchaseRequestRow>();
+  return results;
 }

@@ -1,20 +1,9 @@
 // HMAC-signed tokens for magic-link login and dashboard sessions.
 // Format: base64url(payload-json) + "." + base64url(hmac-sha256(payload)).
 
+import { b64url, b64urlDecode } from "./hash";
+
 const enc = new TextEncoder();
-
-function b64url(bytes: ArrayBuffer | Uint8Array): string {
-  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-  return btoa(String.fromCharCode(...arr))
-    .replaceAll("+", "-")
-    .replaceAll("/", "_")
-    .replaceAll("=", "");
-}
-
-function b64urlDecode(value: string): Uint8Array {
-  const b64 = value.replaceAll("-", "+").replaceAll("_", "/");
-  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-}
 
 async function hmacKey(secret: string): Promise<CryptoKey> {
   return crypto.subtle.importKey(

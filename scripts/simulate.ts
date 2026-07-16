@@ -12,6 +12,12 @@
 
 import { McpHttpClient } from "./mcp-client.ts";
 import { verifyBundle, type VerifiableBundle } from "./verify-bundle.ts";
+import {
+  crossCheckAnchor,
+  verifyReceipt,
+  type VerifiableReceipt,
+} from "./verify-receipt.ts";
+import { ap2Claims, generateIssuerKeypair, mintMandate } from "./test-issuer.ts";
 
 declare const process: {
   argv: string[];
@@ -457,14 +463,271 @@ async function main() {
     );
   }
 
+  // ── Scenario 9: a mandated agent presents network credentials ───────
+  section("Scenario 9 — mandated-agent: payment mandates verified locally");
+  const mandated = await agent(orgId, "mandated-agent");
+  let mandatedRequestId = "";
+  {
+    // Simulate a payment network: a keypair whose PUBLIC half the org
+    // registers as a trusted issuer. No call to any real network, ever.
+    const issuerKeys = await generateIssuerKeypair("Ed25519");
+    await adminPost(`/api/admin/orgs/${orgId}/issuers`, {
+      issuer: "https://ap2.sim.test",
+      scheme: "ap2",
+      alg: "Ed25519",
+      public_key_jwk: issuerKeys.publicJwk,
+    });
+    const mandate = await mintMandate(
+      issuerKeys.privateJwk,
+      "Ed25519",
+      ap2Claims({
+        iss: "https://ap2.sim.test",
+        sub: "mandated-agent",
+        vendors: ["CloudGPU Co"],
+        maxAmountCents: 80_00,
+        currency: "USD",
+      })
+    );
+
+    const ok = await mandated.call("request_purchase", {
+      vendor: "CloudGPU Co",
+      amount_cents: 50_00,
+      currency: "USD",
+      category: "software",
+      justification: "GPU hours under an AP2-style mandate",
+      mandate,
+    });
+    check(
+      ok.status === "approved" && ok.mandate?.status === "verified",
+      "a purchase inside the mandate's scope verifies and approves",
+      `status=${ok.status}, mandate=${ok.mandate?.status}`
+    );
+    check(
+      (ok.trace ?? []).some((t: any) => t.rule === "mandate_ok" && t.result === "pass"),
+      "the decision trace explains the verified mandate"
+    );
+    mandatedRequestId = ok.request_id;
+    await mandated.call("record_outcome", {
+      request_id: mandatedRequestId,
+      final_amount_cents: 50_00,
+      rail: "card",
+      settlement_ref: "SIM-MANDATE-AUTH",
+    });
+
+    const outOfScope = await mandated.call("request_purchase", {
+      vendor: "Figma",
+      amount_cents: 10_00,
+      currency: "USD",
+      category: "software",
+      justification: "vendor the mandate does not cover",
+      mandate,
+    });
+    check(
+      outOfScope.status === "denied" &&
+        outOfScope.rule_fired === "mandate_scope_violation",
+      "a purchase outside the mandate's vendor scope is denied",
+      `rule_fired=${outOfScope.rule_fired}`
+    );
+
+    // Forge the signed payload: bump the amount limit inside the token.
+    const [h, p, s] = mandate.split(".");
+    const forged = `${h}.${p.slice(0, -2)}${p.endsWith("AA") ? "BB" : "AA"}.${s}`;
+    const rejected = await mandated.call("request_purchase", {
+      vendor: "CloudGPU Co",
+      amount_cents: 10_00,
+      currency: "USD",
+      category: "software",
+      justification: "tampered credential",
+      mandate: forged,
+    });
+    check(
+      rejected.status === "denied" && rejected.rule_fired === "mandate_invalid",
+      "a tampered mandate is a hard deny with the signature called out",
+      `rule_fired=${rejected.rule_fired}`
+    );
+  }
+
+  // ── Scenario 10: the settlement feed arrives from three rails ───────
+  section("Scenario 10 — settlement feed: cross-rail matching catches anomalies");
+  const rail = await agent(orgId, "rail-agent");
+  {
+    const buy = async (vendor: string, amountCents: number) => {
+      const res = await rail.call("request_purchase", {
+        vendor,
+        amount_cents: amountCents,
+        currency: "USD",
+        category: "software",
+        justification: `cross-rail purchase at ${vendor}`,
+      });
+      return res.request_id as string;
+    };
+
+    // Card purchase, agent reports the auth code at record_outcome.
+    const cardReq = await buy("RailCard Vendor", 20_00);
+    await rail.call("record_outcome", {
+      request_id: cardReq,
+      final_amount_cents: 20_00,
+      rail: "card",
+      settlement_ref: "SIM-AUTH-1",
+    });
+    // Stripe purchase, agent reports no ref — heuristics must catch it.
+    const stripeReq = await buy("RailStripe Vendor", 35_00);
+    await rail.call("record_outcome", { request_id: stripeReq, final_amount_cents: 35_00 });
+    // Checkout purchase that the merchant will over-charge.
+    const shopReq = await buy("RailShop Vendor", 25_00);
+    await rail.call("record_outcome", {
+      request_id: shopReq,
+      final_amount_cents: 25_00,
+      rail: "checkout",
+      settlement_ref: "SIM-ORD-3",
+    });
+
+    const push = async (railName: string, payload: Record<string, unknown>) =>
+      (await adminPost(`/api/admin/orgs/${orgId}/settlements`, { rail: railName, ...payload }))
+        .results[0];
+
+    const nowIso = new Date().toISOString();
+    const cardMatch = await push("card", {
+      auth_code: "SIM-AUTH-1",
+      merchant: "RailCard Vendor",
+      amount_cents: 20_00,
+      currency: "USD",
+      posted_at: nowIso,
+    });
+    check(
+      cardMatch.match_status === "matched" &&
+        cardMatch.match_method === "settlement_ref" &&
+        cardMatch.matched_request_id === cardReq,
+      "card settlement matches exactly via the agent-reported auth code",
+      JSON.stringify(cardMatch)
+    );
+
+    const stripeMatch = await push("stripe_event", {
+      type: "charge.succeeded",
+      data: {
+        object: {
+          id: "ch_sim_1",
+          amount: 35_00,
+          currency: "usd",
+          description: "RailStripe Vendor",
+          created: Math.floor(Date.now() / 1000),
+        },
+      },
+    });
+    check(
+      stripeMatch.match_status === "matched" &&
+        stripeMatch.match_method === "heuristic" &&
+        stripeMatch.matched_request_id === stripeReq,
+      "a Stripe-shaped event with no shared ref still matches heuristically",
+      JSON.stringify(stripeMatch)
+    );
+
+    const overcharge = await push("checkout", {
+      order_id: "SIM-ORD-3",
+      merchant: "RailShop Vendor",
+      total_cents: 40_00,
+      currency: "USD",
+      completed_at: nowIso,
+    });
+    check(
+      overcharge.match_status === "amount_mismatch" &&
+        overcharge.variance_cents === 15_00,
+      "an over-charged settlement is flagged with the exact variance",
+      JSON.stringify(overcharge)
+    );
+
+    const rogue = await push("card", {
+      auth_code: "SIM-ROGUE",
+      merchant: "Phantom Vendor Ltd",
+      amount_cents: 60_00,
+      currency: "USD",
+      posted_at: nowIso,
+    });
+    check(
+      rogue.match_status === "unauthorized" && rogue.matched_request_id === null,
+      "a charge no agent ever requested is flagged unauthorized",
+      JSON.stringify(rogue)
+    );
+
+    // The mandated purchase from scenario 9 settles cleanly too.
+    const mandateSettle = await push("card", {
+      auth_code: "SIM-MANDATE-AUTH",
+      merchant: "CloudGPU Co",
+      amount_cents: 50_00,
+      currency: "USD",
+      posted_at: nowIso,
+    });
+    check(
+      mandateSettle.match_status === "matched" &&
+        mandateSettle.matched_request_id === mandatedRequestId,
+      "the mandated purchase's settlement matches its reported ref"
+    );
+  }
+
+  // ── Scenario 11: a verifiable receipt survives independent scrutiny ─
+  section("Scenario 11 — receipt: signed proof, verified with zero VeriSpend code");
+  {
+    const receipt = JSON.parse(
+      await (async () => {
+        const res = await fetch(
+          `${BASE_URL}/api/admin/orgs/${orgId}/requests/${mandatedRequestId}/receipt`,
+          { method: "POST", headers: { "content-type": "application/json", "x-admin-key": ADMIN_KEY }, body: "{}" }
+        );
+        if (!res.ok) throw new Error(`receipt issuance failed (${res.status}): ${await res.text()}`);
+        return res.text();
+      })()
+    ) as VerifiableReceipt;
+
+    const verdict = await verifyReceipt(receipt);
+    check(
+      verdict.ok,
+      "the receipt's Ed25519 signature verifies offline",
+      verdict.reason
+    );
+    const payload = JSON.parse(receipt.payload_json);
+    check(
+      payload.mandate?.verification_status === "verified" &&
+        payload.settlement?.match_status === "matched",
+      "one receipt attests the full chain: mandate → approval → settlement match"
+    );
+
+    const wellKnown: any = await (await fetch(`${BASE_URL}/.well-known/verispend-keys.json`)).json();
+    check(
+      wellKnown.keys.some((k: any) => k.kid === receipt.signature.key_id),
+      "the signing key is published at /.well-known/verispend-keys.json"
+    );
+
+    const bundle = JSON.parse(
+      await adminGetText(`/api/admin/orgs/${orgId}/export/audit-bundle.json`)
+    ) as VerifiableBundle;
+    const anchors = crossCheckAnchor(receipt, bundle);
+    check(
+      anchors.ok,
+      `all ${anchors.checked} anchored ledger hashes appear in the verified audit bundle`,
+      anchors.reason
+    );
+
+    const tampered: VerifiableReceipt = {
+      ...receipt,
+      payload_json: receipt.payload_json.replace('"amount_cents":5000', '"amount_cents":500000'),
+    };
+    const caught = await verifyReceipt(tampered);
+    check(
+      !caught.ok,
+      "inflating the amount inside the receipt breaks the signature",
+      caught.ok ? "tampering went undetected!" : undefined
+    );
+  }
+
   // ── Wrap up ─────────────────────────────────────────────────────────
   section("Result");
   console.log(`  ${passed} checks passed, ${failed} failed`);
   console.log(
     `\nDemo org ${orgId} is live: frozen agents (loop-agent, injected-agent), an` +
       `\noverbilled InferenceCloud invoice, a research team that exhausted its shared` +
-      `\nbudget, three pending approvals (one routed to lead@sim.test), and a` +
-      `\nverified audit bundle.` +
+      `\nbudget, three pending approvals (one routed to lead@sim.test), a mandated` +
+      `\npurchase with a signed verifiable receipt, a cross-rail settlement feed with` +
+      `\nan over-charge and an unauthorized charge, and a verified audit bundle.` +
       (APPROVER
         ? `\nLog in at ${BASE_URL}/dashboard as ${APPROVER} to review it.`
         : `\nRe-run with --approver you@example.com to inspect it in the dashboard.`)

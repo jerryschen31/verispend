@@ -48,6 +48,14 @@ export type ReconciliationRules = {
   tolerancePercent?: number;
 };
 
+export type MandateRules = {
+  /**
+   * Deny purchases that lack a verified payment mandate when they match any
+   * of these filters. With no filters set, every purchase needs a mandate.
+   */
+  require?: { amountCentsAtLeast?: number; categories?: string[] };
+};
+
 export type PolicyRules = {
   /** ISO 4217 code all rules are denominated in, e.g. "USD". */
   currency: string;
@@ -69,6 +77,8 @@ export type PolicyRules = {
   circuitBreaker?: CircuitBreakerRules;
   /** Metered-bill reconciliation tolerances; defaults apply when omitted. */
   reconciliation?: ReconciliationRules;
+  /** Payment-mandate requirements; mandates are always optional when omitted. */
+  mandates?: MandateRules;
 };
 
 export type PurchaseIntent = {
@@ -78,6 +88,8 @@ export type PurchaseIntent = {
   currency: string;
   category: string;
   justification: string;
+  /** True when a payment mandate was presented and verified for this intent. */
+  mandateVerified?: boolean;
 };
 
 export type StaticDecision =
@@ -238,6 +250,46 @@ export function evaluatePolicy(
           : {
               result: "pass",
               detail: `${intent.amountCents}¢ is within the ${rules.maxPerTransactionCents}¢ per-transaction cap`,
+            };
+      },
+    ],
+    [
+      "mandate_missing",
+      () => {
+        const require = rules.mandates?.require;
+        if (!require) return NOT_CONFIGURED;
+        const filters: string[] = [];
+        if (require.amountCentsAtLeast !== undefined) {
+          filters.push(`amount ≥ ${require.amountCentsAtLeast}¢`);
+        }
+        if (require.categories?.length) {
+          filters.push(`categories [${require.categories.join(", ")}]`);
+        }
+        const applies =
+          filters.length === 0 ||
+          (require.amountCentsAtLeast !== undefined &&
+            intent.amountCents >= require.amountCentsAtLeast) ||
+          includesNorm(require.categories, intent.category);
+        if (!applies) {
+          return {
+            result: "pass",
+            detail: `purchase does not match the mandate requirement (${filters.join("; ")})`,
+          };
+        }
+        return intent.mandateVerified
+          ? {
+              result: "pass",
+              detail: "a verified payment mandate covers this purchase",
+            }
+          : {
+              result: "triggered",
+              decision: {
+                decision: "denied",
+                ruleFired: "mandate_missing",
+                reason: `Policy requires a verified payment mandate for this purchase${
+                  filters.length ? ` (${filters.join("; ")})` : ""
+                }, and none was presented.`,
+              },
             };
       },
     ],

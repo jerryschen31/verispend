@@ -3,15 +3,23 @@ import { McpAgent } from "agents/mcp";
 import { z } from "zod";
 import {
   getActivePolicy,
+  getLatestReceipt,
   getOrg,
   getPurchaseRequest,
+  getSettlementByRef,
   getTeamForAgent,
   insertDecisionToken,
+  insertPaymentMandate,
   insertPurchaseRequest,
   insertUsageRecord,
   markOutcomeRecorded,
+  updateSettlementMatch,
   type TeamRow,
 } from "./db";
+import { issueReceipt } from "./receipts";
+import { verifyMandate, type MandateVerification } from "./mandate";
+import { classifyMatch } from "./settlements";
+import { resolveReconciliationRules } from "./reconcile";
 import {
   resolveApprovers,
   sendApprovalEmail,
@@ -114,9 +122,16 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
             .string()
             .min(1)
             .describe("Why this purchase serves the task you were given"),
+          mandate: z
+            .string()
+            .optional()
+            .describe(
+              "Signed payment mandate credential (compact JWS) issued by a " +
+                "payment network, if you hold one for this purchase"
+            ),
         },
       },
-      async ({ vendor, amount_cents, currency, category, justification }) => {
+      async ({ vendor, amount_cents, currency, category, justification, mandate }) => {
         const policy = await getActivePolicy(db, orgId);
         if (!policy) {
           return jsonError("No spend policy configured for this org.");
@@ -142,6 +157,7 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
         });
 
         let decision: EvaluatedDecision;
+        let mandateResult: MandateVerification | null = null;
         if (breaker.status === "frozen") {
           const reason =
             `This agent is frozen by the circuit breaker (since ${breaker.frozenAt}): ` +
@@ -160,6 +176,24 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
             reason,
             trace: [{ rule: "circuit_breaker", result: "triggered", detail: reason }],
           };
+        } else if (mandate !== undefined) {
+          // A presented-but-failing credential is a hard deny: an agent waving
+          // a bad permission slip is worse than one presenting none.
+          mandateResult = await verifyMandate(db, orgId, mandate, intent);
+          if (!mandateResult.ok) {
+            decision = {
+              decision: "denied",
+              ruleFired: mandateResult.ruleFired,
+              reason: mandateResult.reason,
+              trace: mandateResult.trace,
+            };
+          } else {
+            decision = evaluatePolicy(policy.rules, {
+              ...intent,
+              mandateVerified: true,
+            });
+            decision.trace = [...mandateResult.trace, ...decision.trace];
+          }
         } else {
           decision = evaluatePolicy(policy.rules, intent);
         }
@@ -237,6 +271,26 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           team_id: decision.decision === "approved" ? team?.id ?? null : null,
         });
 
+        if (mandateResult) {
+          const p = mandateResult.presentation;
+          await insertPaymentMandate(db, {
+            id: `mand_${crypto.randomUUID()}`,
+            org_id: orgId,
+            request_id: requestId,
+            issuer_id: p.issuerId,
+            scheme: p.scheme,
+            issuer: p.issuer,
+            subject: p.subject,
+            mandate_ref: p.mandateRef,
+            scope_json: JSON.stringify(p.scope),
+            not_before: p.notBefore,
+            expires_at: p.expiresAt,
+            token_hash: p.tokenHash,
+            raw_token: mandate ?? "",
+            verification_status: p.status,
+          });
+        }
+
         let routed: { emails: string[]; source: string } | null = null;
         if (!decidedNow) {
           routed = await resolveApprovers(db, orgId, agentId);
@@ -271,6 +325,26 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           eventType: "purchase_requested",
           payload: { ...intent },
         });
+        if (mandateResult) {
+          const p = mandateResult.presentation;
+          await org().appendEvent({
+            orgId,
+            requestId,
+            eventType: mandateResult.ok ? "mandate_verified" : "mandate_rejected",
+            payload: {
+              scheme: p.scheme,
+              issuer: p.issuer,
+              subject: p.subject,
+              mandateRef: p.mandateRef,
+              scope: p.scope,
+              notBefore: p.notBefore,
+              expiresAt: p.expiresAt,
+              tokenHash: p.tokenHash,
+              status: p.status,
+              reason: mandateResult.ok ? null : mandateResult.reason,
+            },
+          });
+        }
         await org().appendEvent({
           orgId,
           requestId,
@@ -325,6 +399,14 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           reason: "reason" in decision ? decision.reason : undefined,
           trace: decision.trace,
           budget: budgetDenied ?? undefined,
+          mandate: mandateResult
+            ? {
+                status: mandateResult.presentation.status,
+                scheme: mandateResult.presentation.scheme,
+                issuer: mandateResult.presentation.issuer,
+                mandate_ref: mandateResult.presentation.mandateRef,
+              }
+            : undefined,
           approval_ref: approvalRef ?? undefined,
           next_step:
             decision.decision === "approved"
@@ -385,9 +467,20 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
             .describe(
               "Optional receipt details: order id, confirmation number, line items"
             ),
+          rail: z
+            .enum(["card", "stablecoin", "checkout", "stripe_event", "other"])
+            .optional()
+            .describe("Payment rail the purchase settled on, if known"),
+          settlement_ref: z
+            .string()
+            .optional()
+            .describe(
+              "The rail's own transaction id — card auth code, tx hash, order " +
+                "id — so the later settlement record matches this purchase exactly"
+            ),
         },
       },
-      async ({ request_id, final_amount_cents, receipt }) => {
+      async ({ request_id, final_amount_cents, receipt, rail, settlement_ref }) => {
         const row = await getPurchaseRequest(db, orgId, request_id);
         if (!row) return jsonError(`No request ${request_id} for this org.`);
         if (row.status !== "approved") {
@@ -408,12 +501,21 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           });
         }
 
-        const outcomeJson = receipt ? JSON.stringify({ receipt }) : null;
+        const outcomeJson =
+          receipt || rail || settlement_ref
+            ? JSON.stringify({
+                receipt: receipt ?? null,
+                rail: rail ?? null,
+                settlement_ref: settlement_ref ?? null,
+              })
+            : null;
         await markOutcomeRecorded(db, {
           orgId,
           requestId: request_id,
           outcomeAmountCents: final_amount_cents,
           outcomeJson,
+          settlementRail: rail ?? null,
+          settlementRef: settlement_ref ?? null,
         });
         await org().appendEvent({
           orgId,
@@ -424,15 +526,90 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
             finalAmountCents: final_amount_cents,
             deltaCents,
             receipt: receipt ?? null,
+            rail: rail ?? null,
+            settlementRef: settlement_ref ?? null,
           },
         });
+
+        // Late-match pass: the rail's settlement record may have landed before
+        // the agent reported. If a still-UNMATCHED settlement with this exact
+        // ref exists, re-point it at this purchase now. Only unmatched
+        // settlements are eligible — otherwise any agent could hijack a
+        // settlement already correctly bound to a different purchase (or
+        // "claim" an unauthorized charge) just by guessing its reference.
+        // Reassigning an already-matched settlement is an admin-only action.
+        let rematched: { settlement_id: string; match_status: string } | null = null;
+        if (rail && settlement_ref) {
+          const settlement = await getSettlementByRef(db, orgId, rail, settlement_ref);
+          if (settlement && settlement.matched_request_id === null) {
+            const policy = await getActivePolicy(db, orgId);
+            const tolerance = resolveReconciliationRules(
+              policy?.rules.reconciliation
+            );
+            const { status, varianceCents } = classifyMatch({
+              settledCents: settlement.amount_cents,
+              referenceCents: final_amount_cents,
+              tolerance,
+            });
+            await updateSettlementMatch(db, {
+              orgId,
+              settlementId: settlement.id,
+              matchStatus: status,
+              matchMethod: "settlement_ref",
+              matchedRequestId: request_id,
+              varianceCents,
+            });
+            await org().appendEvent({
+              orgId,
+              requestId: settlement.id,
+              eventType: "settlement_matched",
+              payload: {
+                status,
+                method: "settlement_ref",
+                matchedRequestId: request_id,
+                varianceCents,
+                tolerance,
+                rematch: true,
+              },
+            });
+            rematched = { settlement_id: settlement.id, match_status: status };
+          }
+        }
 
         return json({
           request_id,
           status: "completed",
           final_amount_cents,
           variance_from_approval_cents: deltaCents,
+          settlement_match: rematched ?? undefined,
         });
+      }
+    );
+
+    this.server.registerTool(
+      "get_receipt",
+      {
+        description:
+          "Fetch the signed verifiable receipt for a decided purchase — proof " +
+          "of what was authorized, under what limits, and how it matched the " +
+          "actual charge. Issues a fresh receipt if none exists yet. Best " +
+          "called after record_outcome so the receipt captures the settlement.",
+        inputSchema: {
+          request_id: z.string().describe("The request_id to attest"),
+        },
+      },
+      async ({ request_id }) => {
+        const existing = await getLatestReceipt(db, orgId, request_id);
+        if (existing) {
+          return json(JSON.parse(existing.receipt_json));
+        }
+        const result = await issueReceipt(this.env, {
+          orgId,
+          requestId: request_id,
+          issuedBy: `mcp:${agentId}`,
+        });
+        if (!result.ok) return jsonError(result.error);
+        return json(result.receipt);
       }
     );
 

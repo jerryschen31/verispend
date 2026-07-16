@@ -16,7 +16,13 @@ export type LedgerEventType =
   | "breaker_reset"
   | "usage_recorded"
   | "bill_ingested"
-  | "bill_reconciled";
+  | "bill_reconciled"
+  | "mandate_verified"
+  | "mandate_rejected"
+  | "settlement_ingested"
+  | "settlement_matched"
+  | "unauthorized_charge"
+  | "receipt_issued";
 
 export type LedgerAppend = {
   orgId: string;

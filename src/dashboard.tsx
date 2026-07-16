@@ -10,9 +10,12 @@ import {
   getActivePolicy,
   getFirstMembershipByEmail,
   getMemberById,
+  getLatestReceipt,
+  getMandateForRequest,
   getMembership,
   getOrg,
   getOrgByApproverEmail,
+  insertMandateIssuer,
   insertPolicy,
   createTeam,
   getPurchaseRequest,
@@ -21,13 +24,17 @@ import {
   listLedgerEventsForRequest,
   listBilledCharges,
   listKnownAgentIds,
+  listMandateIssuers,
   listMembers,
   listPurchaseRequests,
+  listSettlements,
+  listSettlementsForRequest,
   listTeamAgents,
   listTeamApprovers,
   listTeams,
   listUsageRecords,
   revokeAgentKey,
+  revokeMandateIssuer,
   setAgentTeam,
   setTeamApprover,
   upsertMember,
@@ -37,6 +44,9 @@ import {
 } from "./db";
 import { resolveTeamLimits } from "./policy";
 import { ingestBill } from "./reconcile";
+import { ingestSettlement, SETTLEMENT_RAILS } from "./settlements";
+import { issueReceipt } from "./receipts";
+import { MANDATE_ALGS, MANDATE_SCHEMES } from "./mandate";
 import { verifyLedgerChain } from "./ledger";
 import {
   EXPORT_ROW_LIMIT,
@@ -44,6 +54,7 @@ import {
   exportBillsCsv,
   exportLedgerEventsCsv,
   exportPurchasesCsv,
+  exportSettlementsCsv,
   exportUsageCsv,
 } from "./export";
 import type { FrozenAgentRow } from "./org-do";
@@ -109,7 +120,9 @@ const Layout = (props: { title: string; orgName?: string; children: Child }) => 
         <a href="/dashboard">Approvals</a>
         <a href="/dashboard/ledger">Ledger</a>
         <a href="/dashboard/reconciliation">Reconciliation</a>
+        <a href="/dashboard/settlements">Settlements</a>
         <a href="/dashboard/policy">Policy</a>
+        <a href="/dashboard/issuers">Issuers</a>
         <a href="/dashboard/keys">Agent Keys</a>
         <a href="/dashboard/teams">Teams</a>
         <a href="/dashboard/members">Members</a>
@@ -340,6 +353,14 @@ dashboard.use("/dashboard/members", adminPosts);
 dashboard.use("/dashboard/members/delete", adminOnly);
 dashboard.use("/dashboard/teams", adminPosts);
 dashboard.use("/dashboard/teams/*", adminPosts);
+const decidePosts: MiddlewareHandler<{ Bindings: Env; Variables: Vars }> = (
+  c,
+  next
+) => (c.req.method === "POST" ? canDecide(c, next) : next());
+dashboard.use("/dashboard/settlements", decidePosts);
+dashboard.use("/dashboard/issuers", adminPosts);
+dashboard.use("/dashboard/issuers/revoke", adminOnly);
+dashboard.use("/dashboard/requests/:id/receipt", canDecide);
 
 // ---------- Views ----------
 
@@ -452,6 +473,8 @@ const exportFilters = (c: {
   teamId: c.req.query("team") || undefined,
   vendor: c.req.query("vendor") || undefined,
   eventType: c.req.query("type") || undefined,
+  rail: c.req.query("rail") || undefined,
+  matchStatus: c.req.query("match") || undefined,
 });
 
 dashboard.get("/dashboard/export", async (c) => {
@@ -503,6 +526,12 @@ dashboard.get("/dashboard/export", async (c) => {
           <span class="muted">— reconciled bills; filters: from, to, vendor</span>
         </li>
         <li>
+          <a href="/dashboard/export/settlements.csv">settlements.csv</a>{" "}
+          <span class="muted">
+            — cross-rail settlement matches; filters: from, to, rail, match
+          </span>
+        </li>
+        <li>
           <a href="/dashboard/export/audit-bundle.json">audit-bundle.json</a>{" "}
           <span class="muted">
             — full chain + verification + policies; always unfiltered so it
@@ -532,6 +561,11 @@ dashboard.get("/dashboard/export/usage.csv", async (c) => {
 dashboard.get("/dashboard/export/bills.csv", async (c) => {
   const csv = await exportBillsCsv(c.env.DB, c.get("orgId"), exportFilters(c));
   return c.body(csv, 200, csvHeaders("verispend-bills.csv"));
+});
+
+dashboard.get("/dashboard/export/settlements.csv", async (c) => {
+  const csv = await exportSettlementsCsv(c.env.DB, c.get("orgId"), exportFilters(c));
+  return c.body(csv, 200, csvHeaders("verispend-settlements.csv"));
 });
 
 dashboard.get("/dashboard/export/audit-bundle.json", async (c) => {
@@ -669,6 +703,248 @@ dashboard.post("/dashboard/bills", async (c) => {
     );
   }
   return c.redirect("/dashboard/reconciliation");
+});
+
+// ---------- Settlements (Phase 3: cross-rail charge confirmations) ----------
+
+const MATCH_COLORS: Record<string, string> = {
+  matched: "#16a34a",
+  amount_mismatch: "#d97706",
+  unauthorized: "#dc2626",
+};
+
+const MatchPill = ({ status }: { status: string }) => (
+  <span class="pill" style={`background:${MATCH_COLORS[status] ?? "#6b7280"}`}>
+    {status.replaceAll("_", " ")}
+  </span>
+);
+
+dashboard.get("/dashboard/settlements", async (c) => {
+  const orgId = c.get("orgId");
+  const org = await getOrg(c.env.DB, orgId);
+  const settlements = await listSettlements(c.env.DB, orgId);
+  const error = c.req.query("error");
+
+  return c.html(
+    <Layout title="Settlements" orgName={org?.name}>
+      <h2>Enter a settlement record</h2>
+      <p class="muted">
+        The rail's confirmation of what was actually charged — a card record,
+        a stablecoin transaction, a checkout receipt. VeriSpend matches each
+        one to the purchase that authorized it and flags anything no agent
+        ever requested. Feeds can also push these to the settlements API.
+      </p>
+      {error && <p style="color:#dc2626">{error}</p>}
+      <form method="post" action="/dashboard/settlements" style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1.5rem">
+        <select name="rail">
+          {SETTLEMENT_RAILS.map((r) => (
+            <option value={r}>{r.replaceAll("_", " ")}</option>
+          ))}
+        </select>
+        <input name="settlement_ref" placeholder="Rail reference (auth code, tx hash…)" required />
+        <input name="vendor" placeholder="Vendor" required />
+        <input name="amount_cents" type="number" min="1" placeholder="Amount (cents)" required />
+        <input name="currency" placeholder="USD" value="USD" size={5} />
+        <input name="occurred_at" type="datetime-local" required />
+        <button class="btn" style="background:#0f172a">Match</button>
+      </form>
+
+      <h2>Settlements</h2>
+      {settlements.length === 0 ? (
+        <p class="muted">No settlements ingested yet.</p>
+      ) : (
+        <table>
+          <tr>
+            <th>Occurred (UTC)</th>
+            <th>Rail</th>
+            <th>Vendor</th>
+            <th>Amount</th>
+            <th>Reference</th>
+            <th>Match</th>
+            <th>Variance</th>
+            <th>Purchase</th>
+          </tr>
+          {settlements.map((s) => (
+            <tr>
+              <td>{s.occurred_at.slice(0, 16).replace("T", " ")}</td>
+              <td>{s.rail.replaceAll("_", " ")}</td>
+              <td>{s.vendor}</td>
+              <td>{fmt(s.amount_cents, s.currency)}</td>
+              <td>
+                <code>{s.settlement_ref}</code>
+              </td>
+              <td>
+                <MatchPill status={s.match_status} />
+                <div class="muted">{s.match_method.replaceAll("_", " ")}</div>
+              </td>
+              <td style={s.variance_cents > 0 ? "color:#dc2626" : undefined}>
+                {s.variance_cents >= 0 ? "+" : ""}
+                {fmt(s.variance_cents, s.currency)}
+              </td>
+              <td>
+                {s.matched_request_id ? (
+                  <a href={`/dashboard/requests/${s.matched_request_id}`}>view</a>
+                ) : (
+                  <span class="muted">none</span>
+                )}
+              </td>
+            </tr>
+          ))}
+        </table>
+      )}
+    </Layout>
+  );
+});
+
+dashboard.post("/dashboard/settlements", async (c) => {
+  const form = await c.req.formData();
+  const occurredAtRaw = String(form.get("occurred_at") ?? "");
+  const result = await ingestSettlement(c.env, {
+    orgId: c.get("orgId"),
+    rail: String(form.get("rail") ?? ""),
+    payload: {
+      settlement_ref: String(form.get("settlement_ref") ?? ""),
+      vendor: String(form.get("vendor") ?? ""),
+      amount_cents: Number(form.get("amount_cents")),
+      currency: String(form.get("currency") ?? "") || "USD",
+      // datetime-local has no zone; treat it as UTC like everything else.
+      occurred_at: occurredAtRaw && !occurredAtRaw.endsWith("Z") ? `${occurredAtRaw}Z` : occurredAtRaw,
+    },
+    enteredBy: c.get("email"),
+  });
+  if (!result.ok) {
+    return c.redirect(
+      `/dashboard/settlements?error=${encodeURIComponent(result.error)}`
+    );
+  }
+  return c.redirect("/dashboard/settlements");
+});
+
+// ---------- Trusted mandate issuers (Phase 3) ----------
+
+dashboard.get("/dashboard/issuers", async (c) => {
+  const orgId = c.get("orgId");
+  const org = await getOrg(c.env.DB, orgId);
+  const issuers = await listMandateIssuers(c.env.DB, orgId);
+  const error = c.req.query("error");
+  const isAdmin = c.get("role") === "admin";
+
+  return c.html(
+    <Layout title="Mandate issuers" orgName={org?.name}>
+      <h2>Trusted mandate issuers</h2>
+      <p class="muted">
+        VeriSpend accepts a payment mandate only when it is signed by a key
+        registered here. Register the published public key of each network
+        your agents hold credentials from (Google AP2, Visa Verified Agent
+        ID, Stripe) — that is the entire integration. Re-registering an
+        issuer replaces its key.
+      </p>
+      {error && <p style="color:#dc2626">{error}</p>}
+      {isAdmin && (
+        <form method="post" action="/dashboard/issuers" style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1.5rem;align-items:flex-start">
+          <input name="issuer" placeholder='Issuer ("iss" claim)' required />
+          <select name="scheme">
+            {MANDATE_SCHEMES.map((s) => (
+              <option value={s}>{s.replaceAll("_", " ")}</option>
+            ))}
+          </select>
+          <select name="alg">
+            {MANDATE_ALGS.map((a) => (
+              <option value={a}>{a}</option>
+            ))}
+          </select>
+          <textarea name="public_key_jwk" placeholder='Public key JWK, e.g. {"kty":"OKP","crv":"Ed25519","x":"…"}' rows={2} style="width:26rem" required />
+          <button class="btn" style="background:#0f172a">Register</button>
+        </form>
+      )}
+
+      {issuers.length === 0 ? (
+        <p class="muted">No issuers registered; agents cannot present mandates yet.</p>
+      ) : (
+        <table>
+          <tr>
+            <th>Issuer</th>
+            <th>Scheme</th>
+            <th>Algorithm</th>
+            <th>Registered (UTC)</th>
+            <th>Status</th>
+            {isAdmin && <th />}
+          </tr>
+          {issuers.map((i) => (
+            <tr>
+              <td>
+                <code>{i.issuer}</code>
+              </td>
+              <td>{i.scheme.replaceAll("_", " ")}</td>
+              <td>{i.alg}</td>
+              <td>{i.created_at.slice(0, 16).replace("T", " ")}</td>
+              <td>
+                {i.revoked_at ? (
+                  <span class="pill" style="background:#6b7280">revoked</span>
+                ) : (
+                  <span class="pill" style="background:#16a34a">active</span>
+                )}
+              </td>
+              {isAdmin && (
+                <td>
+                  {!i.revoked_at && (
+                    <form method="post" action="/dashboard/issuers/revoke" style="display:inline">
+                      <input type="hidden" name="issuer_id" value={i.id} />
+                      <button class="btn" style="background:#dc2626">Revoke</button>
+                    </form>
+                  )}
+                </td>
+              )}
+            </tr>
+          ))}
+        </table>
+      )}
+    </Layout>
+  );
+});
+
+dashboard.post("/dashboard/issuers", async (c) => {
+  const form = await c.req.formData();
+  const issuer = String(form.get("issuer") ?? "").trim();
+  const scheme = String(form.get("scheme") ?? "");
+  const alg = String(form.get("alg") ?? "");
+  const jwkRaw = String(form.get("public_key_jwk") ?? "");
+  const fail = (error: string) =>
+    c.redirect(`/dashboard/issuers?error=${encodeURIComponent(error)}`);
+  if (!issuer) return fail("issuer is required");
+  if (!(MANDATE_SCHEMES as readonly string[]).includes(scheme)) {
+    return fail("unknown scheme");
+  }
+  if (!(MANDATE_ALGS as readonly string[]).includes(alg)) {
+    return fail("unknown algorithm");
+  }
+  let jwk: unknown;
+  try {
+    jwk = JSON.parse(jwkRaw);
+  } catch {
+    return fail("public key must be valid JWK JSON");
+  }
+  if (typeof jwk !== "object" || jwk === null) {
+    return fail("public key must be a JWK object");
+  }
+  await insertMandateIssuer(c.env.DB, {
+    orgId: c.get("orgId"),
+    issuer,
+    scheme,
+    alg,
+    publicKeyJwk: JSON.stringify(jwk),
+  });
+  return c.redirect("/dashboard/issuers");
+});
+
+dashboard.post("/dashboard/issuers/revoke", async (c) => {
+  const form = await c.req.formData();
+  await revokeMandateIssuer(
+    c.env.DB,
+    c.get("orgId"),
+    String(form.get("issuer_id") ?? "")
+  );
+  return c.redirect("/dashboard/issuers");
 });
 
 dashboard.get("/dashboard/policy", async (c) => {
@@ -887,6 +1163,10 @@ dashboard.get("/dashboard/requests/:id", async (c) => {
   if (!row) return c.text("No such request", 404);
   const org = await getOrg(c.env.DB, orgId);
   const events = await listLedgerEventsForRequest(c.env.DB, orgId, row.id);
+  const mandate = await getMandateForRequest(c.env.DB, orgId, row.id);
+  const settlements = await listSettlementsForRequest(c.env.DB, orgId, row.id);
+  const receipt = await getLatestReceipt(c.env.DB, orgId, row.id);
+  const canAct = c.get("role") !== "viewer";
 
   return c.html(
     <Layout title={`Request ${row.id}`} orgName={org?.name}>
@@ -909,7 +1189,92 @@ dashboard.get("/dashboard/requests/:id", async (c) => {
         {row.outcome_amount_cents !== null && (
           <tr><th>Final charge</th><td>{fmt(row.outcome_amount_cents, row.currency)}</td></tr>
         )}
+        {row.settlement_ref && (
+          <tr>
+            <th>Reported settlement</th>
+            <td>
+              {row.settlement_rail?.replaceAll("_", " ")} ref{" "}
+              <code>{row.settlement_ref}</code>
+            </td>
+          </tr>
+        )}
       </table>
+
+      {mandate && (
+        <>
+          <h3>Payment mandate</h3>
+          <table style="margin-bottom:1.5rem">
+            <tr>
+              <th>Verification</th>
+              <td>
+                <span
+                  class="pill"
+                  style={`background:${mandate.verification_status === "verified" ? "#16a34a" : "#dc2626"}`}
+                >
+                  {mandate.verification_status.replaceAll("_", " ")}
+                </span>
+              </td>
+            </tr>
+            <tr><th>Issuer</th><td><code>{mandate.issuer}</code> ({mandate.scheme.replaceAll("_", " ")})</td></tr>
+            <tr><th>Subject</th><td>{mandate.subject}</td></tr>
+            <tr><th>Mandate ref</th><td><code>{mandate.mandate_ref}</code></td></tr>
+            <tr><th>Scope</th><td><code>{mandate.scope_json}</code></td></tr>
+            {mandate.expires_at && <tr><th>Expires (UTC)</th><td>{mandate.expires_at}</td></tr>}
+          </table>
+        </>
+      )}
+
+      {settlements.length > 0 && (
+        <>
+          <h3>Settlement</h3>
+          <table style="margin-bottom:1.5rem">
+            <tr>
+              <th>Rail</th>
+              <th>Reference</th>
+              <th>Settled</th>
+              <th>Occurred (UTC)</th>
+              <th>Match</th>
+              <th>Variance</th>
+            </tr>
+            {settlements.map((s) => (
+              <tr>
+                <td>{s.rail.replaceAll("_", " ")}</td>
+                <td><code>{s.settlement_ref}</code></td>
+                <td>{fmt(s.amount_cents, s.currency)}</td>
+                <td>{s.occurred_at.slice(0, 16).replace("T", " ")}</td>
+                <td><MatchPill status={s.match_status} /></td>
+                <td>
+                  {s.variance_cents >= 0 ? "+" : ""}
+                  {fmt(s.variance_cents, s.currency)}
+                </td>
+              </tr>
+            ))}
+          </table>
+        </>
+      )}
+
+      <h3>Verifiable receipt</h3>
+      {receipt ? (
+        <p>
+          Receipt <code>{receipt.id}</code> issued{" "}
+          {receipt.created_at.slice(0, 16).replace("T", " ")} UTC by{" "}
+          {receipt.issued_by} —{" "}
+          <a href={`/dashboard/requests/${row.id}/receipt.json`}>download</a>
+          <span class="muted">
+            {" "}
+            (verify offline with <code>scripts/verify-receipt.ts</code>)
+          </span>
+        </p>
+      ) : (
+        <p class="muted">No receipt issued yet.</p>
+      )}
+      {canAct && row.status !== "pending_approval" && (
+        <form method="post" action={`/dashboard/requests/${row.id}/receipt`} style="margin-bottom:1.5rem">
+          <button class="btn" style="background:#0f172a">
+            {receipt ? "Reissue signed receipt" : "Issue signed receipt"}
+          </button>
+        </form>
+      )}
 
       <h3>Ledger timeline</h3>
       {events.map((e) => {
@@ -941,6 +1306,30 @@ dashboard.get("/dashboard/requests/:id", async (c) => {
       </p>
     </Layout>
   );
+});
+
+dashboard.post("/dashboard/requests/:id/receipt", async (c) => {
+  const requestId = c.req.param("id");
+  const result = await issueReceipt(c.env, {
+    orgId: c.get("orgId"),
+    requestId,
+    issuedBy: c.get("email"),
+  });
+  if (!result.ok) return c.text(result.error, 400);
+  return c.redirect(`/dashboard/requests/${requestId}`);
+});
+
+dashboard.get("/dashboard/requests/:id/receipt.json", async (c) => {
+  const row = await getLatestReceipt(
+    c.env.DB,
+    c.get("orgId"),
+    c.req.param("id")
+  );
+  if (!row) return c.text("No receipt issued for this request", 404);
+  return c.body(row.receipt_json, 200, {
+    "content-type": "application/json",
+    "content-disposition": `attachment; filename="verispend-receipt-${row.id}.json"`,
+  });
 });
 
 // ---------- Teams ----------

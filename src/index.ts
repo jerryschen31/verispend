@@ -10,15 +10,25 @@ import {
   getActivePolicy,
   getMembership,
   getOrg,
+  insertMandateIssuer,
   insertPolicy,
+  revokeMandateIssuer,
   setAgentTeam,
   setTeamApprover,
   upsertMember,
   type MemberRole,
 } from "./db";
 import type { BudgetLimits } from "./policy";
-import { buildAuditBundle, exportPurchasesCsv } from "./export";
+import {
+  buildAuditBundle,
+  exportPurchasesCsv,
+  exportSettlementsCsv,
+} from "./export";
 import { ingestBill } from "./reconcile";
+import { ingestSettlement } from "./settlements";
+import { issueReceipt, listReceiptKeys } from "./receipts";
+import { getLatestReceipt } from "./db";
+import { MANDATE_ALGS, MANDATE_SCHEMES } from "./mandate";
 import { DEFAULT_POLICY, type PolicyRules } from "./policy";
 import { VeriSpendMCP } from "./mcp";
 import { OrgCoordinator } from "./org-do";
@@ -28,6 +38,13 @@ export { VeriSpendMCP, OrgCoordinator };
 const app = new Hono<{ Bindings: Env }>();
 
 app.get("/health", (c) => c.json({ ok: true, service: "verispend" }));
+
+// Public receipt-signing keys (Phase 3): the out-of-band anchor a relying
+// party checks a receipt's key_id against. Serves the current key plus every
+// key that ever signed a stored receipt, so rotation never orphans one.
+app.get("/.well-known/verispend-keys.json", async (c) => {
+  return c.json({ keys: await listReceiptKeys(c.env) });
+});
 
 app.get("/", (c) => c.redirect("/dashboard"));
 app.route("/", dashboard);
@@ -201,6 +218,59 @@ app.post("/api/admin/orgs/:orgId/teams", async (c) => {
   return c.json({ team_id: teamId, policy_version: policyVersion });
 });
 
+// Trusted mandate-issuer registry (Phase 3). VeriSpend accepts payment
+// mandates only from issuers whose public keys an org registered here —
+// registering a real network's published key is the entire "integration".
+// The dashboard's issuers page is the session-guarded equivalent.
+app.post("/api/admin/orgs/:orgId/issuers", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  if (!(await getOrg(c.env.DB, orgId))) {
+    return c.json({ error: "no such org" }, 404);
+  }
+  const body = await c.req.json<{
+    issuer?: string;
+    scheme?: string;
+    alg?: string;
+    public_key_jwk?: Record<string, unknown>;
+  }>();
+  if (!body.issuer?.trim()) return c.json({ error: "issuer is required" }, 400);
+  if (!body.scheme || !(MANDATE_SCHEMES as readonly string[]).includes(body.scheme)) {
+    return c.json(
+      { error: `scheme must be one of: ${MANDATE_SCHEMES.join(", ")}` },
+      400
+    );
+  }
+  if (!body.alg || !(MANDATE_ALGS as readonly string[]).includes(body.alg)) {
+    return c.json({ error: `alg must be one of: ${MANDATE_ALGS.join(", ")}` }, 400);
+  }
+  if (typeof body.public_key_jwk !== "object" || body.public_key_jwk === null) {
+    return c.json({ error: "public_key_jwk must be a JWK object" }, 400);
+  }
+  const { issuerId } = await insertMandateIssuer(c.env.DB, {
+    orgId,
+    issuer: body.issuer,
+    scheme: body.scheme,
+    alg: body.alg,
+    publicKeyJwk: JSON.stringify(body.public_key_jwk),
+  });
+  return c.json({ issuer_id: issuerId });
+});
+
+app.post("/api/admin/orgs/:orgId/issuers/:issuerId/revoke", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  if (!(await getOrg(c.env.DB, orgId))) {
+    return c.json({ error: "no such org" }, 404);
+  }
+  await revokeMandateIssuer(c.env.DB, orgId, c.req.param("issuerId"));
+  return c.json({ ok: true });
+});
+
 // Bill ingestion for API-driven workflows (and the agent simulator). The
 // dashboard form at /dashboard/bills is the session-guarded equivalent.
 app.post("/api/admin/orgs/:orgId/bills", async (c) => {
@@ -236,6 +306,84 @@ app.post("/api/admin/orgs/:orgId/bills", async (c) => {
   });
 });
 
+// Settlement ingestion (Phase 3): rails and finance systems push settlement
+// confirmations here; VeriSpend never pulls them. Accepts one record or a
+// batch. The dashboard form at /dashboard/settlements is the session-guarded
+// equivalent.
+app.post("/api/admin/orgs/:orgId/settlements", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  if (!(await getOrg(c.env.DB, orgId))) {
+    return c.json({ error: "no such org" }, 404);
+  }
+  const body = await c.req.json<
+    { rail?: string; settlements?: Array<Record<string, unknown>> } & Record<
+      string,
+      unknown
+    >
+  >();
+  if (typeof body.rail !== "string") {
+    return c.json({ error: "rail is required" }, 400);
+  }
+  const payloads = Array.isArray(body.settlements)
+    ? body.settlements
+    : [body as Record<string, unknown>];
+  const results = [];
+  for (const payload of payloads) {
+    const result = await ingestSettlement(c.env, {
+      orgId,
+      rail: body.rail,
+      payload,
+      enteredBy: "admin-api",
+    });
+    results.push(
+      result.ok
+        ? {
+            settlement_id: result.settlement.id,
+            match_status: result.settlement.match_status,
+            match_method: result.settlement.match_method,
+            matched_request_id: result.settlement.matched_request_id,
+            variance_cents: result.settlement.variance_cents,
+            duplicate: result.duplicate,
+          }
+        : { error: result.error }
+    );
+  }
+  return c.json({ results });
+});
+
+// Verifiable receipts (Phase 3): issue a freshly signed receipt for a
+// decided purchase, or fetch the newest one. The dashboard's request-detail
+// page is the session-guarded equivalent.
+app.post("/api/admin/orgs/:orgId/requests/:requestId/receipt", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  if (!(await getOrg(c.env.DB, orgId))) {
+    return c.json({ error: "no such org" }, 404);
+  }
+  const result = await issueReceipt(c.env, {
+    orgId,
+    requestId: c.req.param("requestId"),
+    issuedBy: "admin-api",
+  });
+  if (!result.ok) return c.json({ error: result.error }, 400);
+  return c.json(result.receipt);
+});
+
+app.get("/api/admin/orgs/:orgId/requests/:requestId/receipt.json", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  const row = await getLatestReceipt(c.env.DB, orgId, c.req.param("requestId"));
+  if (!row) return c.json({ error: "no receipt issued for this request" }, 404);
+  return c.body(row.receipt_json, 200, { "content-type": "application/json" });
+});
+
 // Admin-key twins of the dashboard exports, for the simulator and CI (no
 // session machinery in Node). Same query params as the dashboard routes.
 app.get("/api/admin/orgs/:orgId/export/purchases.csv", async (c) => {
@@ -252,6 +400,23 @@ app.get("/api/admin/orgs/:orgId/export/purchases.csv", async (c) => {
     agentId: c.req.query("agent") || undefined,
     status: c.req.query("status") || undefined,
     teamId: c.req.query("team") || undefined,
+  });
+  return c.body(csv, 200, { "content-type": "text/csv; charset=utf-8" });
+});
+
+app.get("/api/admin/orgs/:orgId/export/settlements.csv", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  if (!(await getOrg(c.env.DB, orgId))) {
+    return c.json({ error: "no such org" }, 404);
+  }
+  const csv = await exportSettlementsCsv(c.env.DB, orgId, {
+    from: c.req.query("from") || undefined,
+    to: c.req.query("to") || undefined,
+    rail: c.req.query("rail") || undefined,
+    matchStatus: c.req.query("match") || undefined,
   });
   return c.body(csv, 200, { "content-type": "text/csv; charset=utf-8" });
 });
