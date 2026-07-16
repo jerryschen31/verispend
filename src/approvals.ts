@@ -1,12 +1,66 @@
 import {
+  getDecisionToken,
   getOrg,
   getPolicyByVersion,
   getPurchaseRequest,
   getRequestByDecisionToken,
+  getTeamForAgent,
+  listMembers,
+  listTeamApprovers,
   applyHumanDecision,
   type PurchaseRequestRow,
 } from "./db";
-import { resolveAgentLimits, resolveOrgLimits } from "./policy";
+import {
+  resolveAgentLimits,
+  resolveOrgLimits,
+  resolveTeamLimits,
+} from "./policy";
+
+/** How a human decision reached us; recorded on the ledger. */
+export type DecisionVia = "email_link" | "dashboard";
+
+export type DecisionAttribution = { approver: string; via: DecisionVia };
+
+const MAX_APPROVAL_RECIPIENTS = 10;
+
+/**
+ * Who should be asked to approve this agent's requests: the agent's team
+ * approvers first, then all org admins/approvers, then the legacy
+ * orgs.approver_email (orgs provisioned before the members migration).
+ */
+export async function resolveApprovers(
+  db: D1Database,
+  orgId: string,
+  agentId: string | null
+): Promise<{ emails: string[]; source: "team" | "org" | "legacy" }> {
+  const dedup = (emails: string[]) =>
+    [...new Set(emails)].slice(0, MAX_APPROVAL_RECIPIENTS);
+
+  if (agentId) {
+    const team = await getTeamForAgent(db, orgId, agentId);
+    if (team) {
+      const approvers = (await listTeamApprovers(db, team.id)).filter(
+        (m) => m.role !== "viewer"
+      );
+      if (approvers.length > 0) {
+        return { emails: dedup(approvers.map((m) => m.email)), source: "team" };
+      }
+    }
+  }
+
+  const members = (await listMembers(db, orgId)).filter(
+    (m) => m.role === "admin" || m.role === "approver"
+  );
+  if (members.length > 0) {
+    return { emails: dedup(members.map((m) => m.email)), source: "org" };
+  }
+
+  const org = await getOrg(db, orgId);
+  return {
+    emails: org?.approver_email ? [org.approver_email] : [],
+    source: "legacy",
+  };
+}
 
 const fmt = (cents: number, currency: string) =>
   new Intl.NumberFormat("en-US", { style: "currency", currency }).format(
@@ -189,30 +243,54 @@ export async function decideRequest(
   decisionToken: string,
   action: "approve" | "deny"
 ): Promise<DecisionOutcome> {
+  // Per-recipient tokens attribute the click to a specific member.
+  const tokenRow = await getDecisionToken(env.DB, decisionToken);
+  if (tokenRow) {
+    const row = await getPurchaseRequest(
+      env.DB,
+      tokenRow.org_id,
+      tokenRow.request_id
+    );
+    if (!row) {
+      return { ok: false, title: "Not found", detail: "This approval link is invalid." };
+    }
+    return decideRequestRow(env, row, action, {
+      approver: tokenRow.recipient_email,
+      via: "email_link",
+    });
+  }
+
+  // Legacy fallback: single-token requests in flight before migration 0006.
   const row = await getRequestByDecisionToken(env.DB, decisionToken);
   if (!row) {
     return { ok: false, title: "Not found", detail: "This approval link is invalid." };
   }
-  return decideRequestRow(env, row, action);
+  const org = await getOrg(env.DB, row.org_id);
+  return decideRequestRow(env, row, action, {
+    approver: org?.approver_email ?? "approver",
+    via: "email_link",
+  });
 }
 
 export async function decideRequestById(
   env: Env,
   orgId: string,
   requestId: string,
-  action: "approve" | "deny"
+  action: "approve" | "deny",
+  attribution: DecisionAttribution
 ): Promise<DecisionOutcome> {
   const row = await getPurchaseRequest(env.DB, orgId, requestId);
   if (!row) {
     return { ok: false, title: "Not found", detail: "No such request." };
   }
-  return decideRequestRow(env, row, action);
+  return decideRequestRow(env, row, action, attribution);
 }
 
 async function decideRequestRow(
   env: Env,
   row: PurchaseRequestRow,
-  action: "approve" | "deny"
+  action: "approve" | "deny",
+  attribution: DecisionAttribution
 ): Promise<DecisionOutcome> {
   if (row.status !== "pending_approval") {
     return {
@@ -222,8 +300,7 @@ async function decideRequestRow(
     };
   }
 
-  const org = await getOrg(env.DB, row.org_id);
-  const approver = org?.approver_email ?? "approver";
+  const { approver, via } = attribution;
   const coordinator = env.ORG.getByName(row.org_id);
 
   if (action === "deny") {
@@ -238,7 +315,7 @@ async function decideRequestRow(
       orgId: row.org_id,
       requestId: row.id,
       eventType: "human_decision",
-      payload: { decision: "denied", approver },
+      payload: { decision: "denied", approver, via },
     });
     return {
       ok: true,
@@ -251,15 +328,22 @@ async function decideRequestRow(
   // pending), so enforce it now against the policy version the request was
   // evaluated under.
   const policy = await getPolicyByVersion(env.DB, row.org_id, row.policy_version);
+  const team = await getTeamForAgent(env.DB, row.org_id, row.agent_id);
   const reserve = await coordinator.reserve({
     agentId: row.agent_id,
     amountCents: row.amount_cents,
     orgLimits: policy ? resolveOrgLimits(policy.rules) : undefined,
     agentLimits: policy ? resolveAgentLimits(policy.rules, row.agent_id) : undefined,
+    teamId: team?.id,
+    teamLimits: policy ? resolveTeamLimits(policy.rules, team?.id) : undefined,
   });
 
   if (!reserve.ok) {
-    const reason = `Approved by ${approver}, but the ${reserve.exceeded.replaceAll("_", " ")} budget no longer fits this purchase (${reserve.usedCents}¢ of ${reserve.limitCents}¢ used).`;
+    const scopeName =
+      reserve.scope === "team"
+        ? `team "${team?.name ?? "unknown"}" ${reserve.period}`
+        : `${reserve.scope} ${reserve.period}`;
+    const reason = `Approved by ${approver}, but the ${scopeName} budget no longer fits this purchase (${reserve.usedCents}¢ of ${reserve.limitCents}¢ used).`;
     await applyHumanDecision(env.DB, {
       orgId: row.org_id,
       requestId: row.id,
@@ -271,7 +355,7 @@ async function decideRequestRow(
       orgId: row.org_id,
       requestId: row.id,
       eventType: "human_decision",
-      payload: { decision: "denied", approver, reason, budget: reserve },
+      payload: { decision: "denied", approver, via, reason, budget: reserve },
     });
     return { ok: true, title: "Budget exceeded", detail: reason };
   }
@@ -283,12 +367,15 @@ async function decideRequestRow(
     status: "approved",
     approver,
     approvalRef,
+    // Pin the team the budget was just reserved against, so record_outcome
+    // corrects this team even if the agent is later reassigned.
+    teamId: team?.id ?? null,
   });
   await coordinator.appendEvent({
     orgId: row.org_id,
     requestId: row.id,
     eventType: "human_decision",
-    payload: { decision: "approved", approver, approvalRef },
+    payload: { decision: "approved", approver, via, approvalRef },
   });
   return {
     ok: true,

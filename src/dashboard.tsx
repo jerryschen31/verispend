@@ -3,21 +3,49 @@ import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import type { Child } from "hono/jsx";
 import { decideRequestById } from "./approvals";
 import {
+  MEMBER_ROLES,
+  countAdmins,
   createAgentKey,
+  deleteMember,
   getActivePolicy,
+  getFirstMembershipByEmail,
+  getMemberById,
+  getMembership,
   getOrg,
   getOrgByApproverEmail,
   insertPolicy,
+  createTeam,
+  getPurchaseRequest,
+  getTeam,
   listAgentKeys,
+  listLedgerEventsForRequest,
   listBilledCharges,
+  listKnownAgentIds,
+  listMembers,
   listPurchaseRequests,
+  listTeamAgents,
+  listTeamApprovers,
+  listTeams,
   listUsageRecords,
   revokeAgentKey,
+  setAgentTeam,
+  setTeamApprover,
+  upsertMember,
+  type MemberRole,
   type PurchaseRequestRow,
   type RequestStatus,
 } from "./db";
+import { resolveTeamLimits } from "./policy";
 import { ingestBill } from "./reconcile";
 import { verifyLedgerChain } from "./ledger";
+import {
+  EXPORT_ROW_LIMIT,
+  buildAuditBundle,
+  exportBillsCsv,
+  exportLedgerEventsCsv,
+  exportPurchasesCsv,
+  exportUsageCsv,
+} from "./export";
 import type { FrozenAgentRow } from "./org-do";
 import type { PolicyRules } from "./policy";
 import {
@@ -34,7 +62,7 @@ import {
   logoutUrl,
 } from "./kinde";
 
-type Vars = { orgId: string; email: string };
+type Vars = { orgId: string; email: string; role: MemberRole };
 
 export const dashboard = new Hono<{ Bindings: Env; Variables: Vars }>();
 
@@ -83,6 +111,9 @@ const Layout = (props: { title: string; orgName?: string; children: Child }) => 
         <a href="/dashboard/reconciliation">Reconciliation</a>
         <a href="/dashboard/policy">Policy</a>
         <a href="/dashboard/keys">Agent Keys</a>
+        <a href="/dashboard/teams">Teams</a>
+        <a href="/dashboard/members">Members</a>
+        <a href="/dashboard/export">Export</a>
         <a href="/dashboard/audit">Audit</a>
         <span style="flex:1" />
         {props.orgName && <span class="muted">{props.orgName}</span>}
@@ -116,7 +147,11 @@ const RequestTable = (props: {
     </tr>
     {props.rows.map((r) => (
       <tr>
-        <td>{r.created_at.slice(0, 16).replace("T", " ")}</td>
+        <td>
+          <a href={`/dashboard/requests/${r.id}`}>
+            {r.created_at.slice(0, 16).replace("T", " ")}
+          </a>
+        </td>
         <td>{r.agent_id}</td>
         <td>
           {r.vendor}
@@ -203,14 +238,27 @@ dashboard.get("/auth/callback", async (c) => {
     return c.text("Sign-in failed. Please try again.", 401);
   }
 
-  const org = await getOrgByApproverEmail(c.env.DB, result.email);
-  if (!org) {
+  let membership = await getFirstMembershipByEmail(c.env.DB, result.email);
+  if (!membership) {
+    // One-release safety net for orgs created between code deploy and the
+    // 0004 migration seed: promote a legacy approver_email to admin member.
+    const legacyOrg = await getOrgByApproverEmail(c.env.DB, result.email);
+    if (legacyOrg) {
+      await upsertMember(c.env.DB, {
+        orgId: legacyOrg.id,
+        email: result.email,
+        role: "admin",
+      });
+      membership = await getMembership(c.env.DB, legacyOrg.id, result.email);
+    }
+  }
+  if (!membership) {
     return c.html(
       <body style="font-family:system-ui;max-width:28rem;margin:5rem auto">
         <h1>No org for this account</h1>
         <p>
           You signed in as <strong>{result.email}</strong>, but that address is
-          not an approver for any VeriSpend org.
+          not a member of any VeriSpend org.
         </p>
         <a href={logoutUrl(c.env)}>Sign in with a different account</a>
       </body>,
@@ -220,8 +268,8 @@ dashboard.get("/auth/callback", async (c) => {
 
   const session = await signToken(c.env.SESSION_SECRET, {
     purpose: "session",
-    email: result.email,
-    orgId: org.id,
+    email: membership.email,
+    orgId: membership.org_id,
     exp: Date.now() + SESSION_TTL_MS,
   });
   setCookie(c, SESSION_COOKIE, session, {
@@ -250,12 +298,48 @@ const requireSession: MiddlewareHandler<{
     ? await verifyToken(c.env.SESSION_SECRET, cookie, "session")
     : null;
   if (!payload) return c.redirect("/login");
+  // Role is looked up per request (not stored in the token) so removing or
+  // downgrading a member takes effect immediately.
+  const membership = await getMembership(c.env.DB, payload.orgId, payload.email);
+  if (!membership) {
+    deleteCookie(c, SESSION_COOKIE, { path: "/" });
+    return c.redirect("/login");
+  }
   c.set("orgId", payload.orgId);
   c.set("email", payload.email);
+  c.set("role", membership.role);
   await next();
 };
 dashboard.use("/dashboard", requireSession);
 dashboard.use("/dashboard/*", requireSession);
+
+const requireRole =
+  (...roles: MemberRole[]): MiddlewareHandler<{ Bindings: Env; Variables: Vars }> =>
+  async (c, next) => {
+    if (!roles.includes(c.get("role"))) {
+      return c.text(`Forbidden: requires ${roles.join(" or ")} role.`, 403);
+    }
+    await next();
+  };
+const adminOnly = requireRole("admin");
+const canDecide = requireRole("admin", "approver");
+
+dashboard.use("/dashboard/decide", canDecide);
+dashboard.use("/dashboard/bills", canDecide);
+dashboard.use("/dashboard/policy", async (c, next) =>
+  c.req.method === "POST" ? adminOnly(c, next) : next()
+);
+dashboard.use("/dashboard/keys/create", adminOnly);
+dashboard.use("/dashboard/keys/revoke", adminOnly);
+dashboard.use("/dashboard/agents/unfreeze", adminOnly);
+const adminPosts: MiddlewareHandler<{ Bindings: Env; Variables: Vars }> = (
+  c,
+  next
+) => (c.req.method === "POST" ? adminOnly(c, next) : next());
+dashboard.use("/dashboard/members", adminPosts);
+dashboard.use("/dashboard/members/delete", adminOnly);
+dashboard.use("/dashboard/teams", adminPosts);
+dashboard.use("/dashboard/teams/*", adminPosts);
 
 // ---------- Views ----------
 
@@ -292,7 +376,7 @@ dashboard.get("/dashboard", async (c) => {
       {pending.length === 0 ? (
         <p class="muted">Nothing waiting on you.</p>
       ) : (
-        <RequestTable rows={pending} actions />
+        <RequestTable rows={pending} actions={c.get("role") !== "viewer"} />
       )}
       <h2>Recent activity</h2>
       <RequestTable rows={recent} />
@@ -305,7 +389,10 @@ dashboard.post("/dashboard/decide", async (c) => {
   const requestId = String(form.get("request_id") ?? "");
   const action = String(form.get("action") ?? "");
   if (action === "approve" || action === "deny") {
-    await decideRequestById(c.env, c.get("orgId"), requestId, action);
+    await decideRequestById(c.env, c.get("orgId"), requestId, action, {
+      approver: c.get("email"),
+      via: "dashboard",
+    });
   }
   return c.redirect("/dashboard");
 });
@@ -343,36 +430,115 @@ dashboard.get("/dashboard/ledger", async (c) => {
   );
 });
 
-dashboard.get("/dashboard/ledger.csv", async (c) => {
-  const rows = await listPurchaseRequests(c.env.DB, c.get("orgId"), {
-    limit: 10_000,
-  });
-  const esc = (v: unknown) => `"${String(v ?? "").replaceAll('"', '""')}"`;
-  const header =
-    "id,created_at,agent_id,vendor,amount_cents,currency,category,justification,status,rule_fired,denial_reason,approver,decided_at,outcome_amount_cents";
-  const lines = rows.map((r) =>
-    [
-      r.id,
-      r.created_at,
-      r.agent_id,
-      r.vendor,
-      r.amount_cents,
-      r.currency,
-      r.category,
-      r.justification,
-      r.status,
-      r.rule_fired,
-      r.denial_reason,
-      r.approver,
-      r.decided_at,
-      r.outcome_amount_cents,
-    ]
-      .map(esc)
-      .join(",")
+// Legacy export URL; the filtered exports live under /dashboard/export.
+dashboard.get("/dashboard/ledger.csv", (c) =>
+  c.redirect("/dashboard/export/purchases.csv")
+);
+
+// ---------- Exports ----------
+
+const csvHeaders = (filename: string) => ({
+  "content-type": "text/csv; charset=utf-8",
+  "content-disposition": `attachment; filename="${filename}"`,
+});
+
+const exportFilters = (c: {
+  req: { query: (k: string) => string | undefined };
+}) => ({
+  from: c.req.query("from") || undefined,
+  to: c.req.query("to") || undefined,
+  agentId: c.req.query("agent") || undefined,
+  status: c.req.query("status") || undefined,
+  teamId: c.req.query("team") || undefined,
+  vendor: c.req.query("vendor") || undefined,
+  eventType: c.req.query("type") || undefined,
+});
+
+dashboard.get("/dashboard/export", async (c) => {
+  const orgId = c.get("orgId");
+  const org = await getOrg(c.env.DB, orgId);
+  const teams = await listTeams(c.env.DB, orgId);
+  return c.html(
+    <Layout title="Export" orgName={org?.name}>
+      <h2>Audit exports</h2>
+      <p class="muted">
+        Filtered CSV exports of every record type (capped at{" "}
+        {EXPORT_ROW_LIMIT.toLocaleString()} rows), plus a self-verifiable JSON
+        audit bundle carrying the full hash chain and the recipe to re-verify
+        it without VeriSpend.
+      </p>
+      <form method="get" action="/dashboard/export/purchases.csv" style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1rem">
+        <label>From <input name="from" type="date" /></label>
+        <label>To <input name="to" type="date" /></label>
+        <input name="agent" placeholder="Agent id" />
+        <select name="status">
+          <option value="">All statuses</option>
+          {(["approved", "completed", "pending_approval", "denied"] as const).map((s) => (
+            <option value={s}>{s.replaceAll("_", " ")}</option>
+          ))}
+        </select>
+        <select name="team">
+          <option value="">All teams</option>
+          {teams.map((t) => (
+            <option value={t.id}>{t.name}</option>
+          ))}
+        </select>
+        <button class="btn" style="background:#0f172a">Purchases CSV</button>
+      </form>
+      <ul>
+        <li>
+          <a href="/dashboard/export/purchases.csv">purchases.csv</a>{" "}
+          <span class="muted">— filters: from, to, agent, status, team</span>
+        </li>
+        <li>
+          <a href="/dashboard/export/ledger-events.csv">ledger-events.csv</a>{" "}
+          <span class="muted">— the hash chain itself; filters: from, to, type</span>
+        </li>
+        <li>
+          <a href="/dashboard/export/usage.csv">usage.csv</a>{" "}
+          <span class="muted">— metered usage; filters: from, to, agent, vendor</span>
+        </li>
+        <li>
+          <a href="/dashboard/export/bills.csv">bills.csv</a>{" "}
+          <span class="muted">— reconciled bills; filters: from, to, vendor</span>
+        </li>
+        <li>
+          <a href="/dashboard/export/audit-bundle.json">audit-bundle.json</a>{" "}
+          <span class="muted">
+            — full chain + verification + policies; always unfiltered so it
+            can self-verify
+          </span>
+        </li>
+      </ul>
+    </Layout>
   );
-  return c.body([header, ...lines].join("\n"), 200, {
-    "content-type": "text/csv; charset=utf-8",
-    "content-disposition": 'attachment; filename="verispend-ledger.csv"',
+});
+
+dashboard.get("/dashboard/export/purchases.csv", async (c) => {
+  const csv = await exportPurchasesCsv(c.env.DB, c.get("orgId"), exportFilters(c));
+  return c.body(csv, 200, csvHeaders("verispend-purchases.csv"));
+});
+
+dashboard.get("/dashboard/export/ledger-events.csv", async (c) => {
+  const csv = await exportLedgerEventsCsv(c.env.DB, c.get("orgId"), exportFilters(c));
+  return c.body(csv, 200, csvHeaders("verispend-ledger-events.csv"));
+});
+
+dashboard.get("/dashboard/export/usage.csv", async (c) => {
+  const csv = await exportUsageCsv(c.env.DB, c.get("orgId"), exportFilters(c));
+  return c.body(csv, 200, csvHeaders("verispend-usage.csv"));
+});
+
+dashboard.get("/dashboard/export/bills.csv", async (c) => {
+  const csv = await exportBillsCsv(c.env.DB, c.get("orgId"), exportFilters(c));
+  return c.body(csv, 200, csvHeaders("verispend-bills.csv"));
+});
+
+dashboard.get("/dashboard/export/audit-bundle.json", async (c) => {
+  const bundle = await buildAuditBundle(c.env.DB, c.get("orgId"));
+  return c.body(JSON.stringify(bundle, null, 2), 200, {
+    "content-type": "application/json",
+    "content-disposition": 'attachment; filename="verispend-audit-bundle.json"',
   });
 });
 
@@ -518,12 +684,16 @@ dashboard.get("/dashboard/policy", async (c) => {
         they were evaluated under. Amounts are integer cents.
       </p>
       <form method="post" action="/dashboard/policy">
-        <textarea name="rules" rows={18}>
+        <textarea name="rules" rows={18} readonly={c.get("role") !== "admin"}>
           {JSON.stringify(policy?.rules ?? {}, null, 2)}
         </textarea>
-        <button class="btn" style="background:#0f172a;margin-top:0.6rem">
-          Save new version
-        </button>
+        {c.get("role") === "admin" ? (
+          <button class="btn" style="background:#0f172a;margin-top:0.6rem">
+            Save new version
+          </button>
+        ) : (
+          <p class="muted">Only admins can edit the policy.</p>
+        )}
       </form>
     </Layout>
   );
@@ -582,10 +752,12 @@ dashboard.get("/dashboard/keys", async (c) => {
                 <td>{f.signal.replaceAll("_", " ")}</td>
                 <td class="muted">{f.reason}</td>
                 <td>
-                  <form method="post" action="/dashboard/agents/unfreeze">
-                    <input type="hidden" name="agent_id" value={f.agent_id} />
-                    <button class="btn" style="background:#16a34a">Unfreeze</button>
-                  </form>
+                  {c.get("role") === "admin" && (
+                    <form method="post" action="/dashboard/agents/unfreeze">
+                      <input type="hidden" name="agent_id" value={f.agent_id} />
+                      <button class="btn" style="background:#16a34a">Unfreeze</button>
+                    </form>
+                  )}
                 </td>
               </tr>
             ))}
@@ -593,10 +765,12 @@ dashboard.get("/dashboard/keys", async (c) => {
         </>
       )}
       <h2>Agent API keys</h2>
-      <form method="post" action="/dashboard/keys/create" style="display:flex;gap:0.5rem;margin-bottom:1rem">
-        <input name="agent_id" placeholder="Agent id, e.g. travel-agent" required />
-        <button class="btn" style="background:#0f172a">Create key</button>
-      </form>
+      {c.get("role") === "admin" && (
+        <form method="post" action="/dashboard/keys/create" style="display:flex;gap:0.5rem;margin-bottom:1rem">
+          <input name="agent_id" placeholder="Agent id, e.g. travel-agent" required />
+          <button class="btn" style="background:#0f172a">Create key</button>
+        </form>
+      )}
       <table>
         <tr>
           <th>Agent</th>
@@ -610,7 +784,7 @@ dashboard.get("/dashboard/keys", async (c) => {
             <td>{k.created_at.slice(0, 16).replace("T", " ")}</td>
             <td>{k.revoked_at ? <span class="muted">revoked</span> : "active"}</td>
             <td>
-              {!k.revoked_at && (
+              {!k.revoked_at && c.get("role") === "admin" && (
                 <form method="post" action="/dashboard/keys/revoke">
                   <input type="hidden" name="key_id" value={k.id} />
                   <button class="btn" style="background:#dc2626">Revoke</button>
@@ -674,6 +848,450 @@ dashboard.post("/dashboard/keys/revoke", async (c) => {
   const form = await c.req.formData();
   await revokeAgentKey(c.env.DB, c.get("orgId"), String(form.get("key_id") ?? ""));
   return c.redirect("/dashboard/keys");
+});
+
+// ---------- Request detail (explainability) ----------
+
+const TRACE_COLORS: Record<string, string> = {
+  pass: "#16a34a",
+  triggered: "#dc2626",
+  skipped: "#6b7280",
+};
+
+const TraceTable = ({ trace }: { trace: Array<{ rule: string; result: string; detail?: string }> }) => (
+  <table style="margin-bottom:1rem">
+    <tr>
+      <th>Rule</th>
+      <th>Result</th>
+      <th>Detail</th>
+    </tr>
+    {trace.map((t) => (
+      <tr>
+        <td>
+          <code>{t.rule}</code>
+        </td>
+        <td>
+          <span class="pill" style={`background:${TRACE_COLORS[t.result] ?? "#6b7280"}`}>
+            {t.result}
+          </span>
+        </td>
+        <td class="muted">{t.detail ?? ""}</td>
+      </tr>
+    ))}
+  </table>
+);
+
+dashboard.get("/dashboard/requests/:id", async (c) => {
+  const orgId = c.get("orgId");
+  const row = await getPurchaseRequest(c.env.DB, orgId, c.req.param("id"));
+  if (!row) return c.text("No such request", 404);
+  const org = await getOrg(c.env.DB, orgId);
+  const events = await listLedgerEventsForRequest(c.env.DB, orgId, row.id);
+
+  return c.html(
+    <Layout title={`Request ${row.id}`} orgName={org?.name}>
+      <h2>
+        {row.vendor} — {fmt(row.amount_cents, row.currency)}{" "}
+        <StatusPill status={row.status} />
+      </h2>
+      <table style="margin-bottom:1.5rem">
+        <tr><th>Request</th><td><code>{row.id}</code></td></tr>
+        <tr><th>Agent</th><td>{row.agent_id}</td></tr>
+        <tr><th>Category</th><td>{row.category}</td></tr>
+        <tr><th>Justification</th><td>{row.justification}</td></tr>
+        <tr><th>Requested (UTC)</th><td>{row.created_at}</td></tr>
+        <tr><th>Rule fired</th><td><code>{row.rule_fired}</code></td></tr>
+        {row.denial_reason && (
+          <tr><th>Denial reason</th><td>{row.denial_reason}</td></tr>
+        )}
+        {row.approver && <tr><th>Decided by</th><td>{row.approver}</td></tr>}
+        {row.decided_at && <tr><th>Decided (UTC)</th><td>{row.decided_at}</td></tr>}
+        {row.outcome_amount_cents !== null && (
+          <tr><th>Final charge</th><td>{fmt(row.outcome_amount_cents, row.currency)}</td></tr>
+        )}
+      </table>
+
+      <h3>Ledger timeline</h3>
+      {events.map((e) => {
+        const payload = JSON.parse(e.payload_json) as Record<string, unknown>;
+        const trace = Array.isArray(payload.trace)
+          ? (payload.trace as Array<{ rule: string; result: string; detail?: string }>)
+          : null;
+        return (
+          <div style="margin-bottom:1.2rem">
+            <p style="margin-bottom:0.4rem">
+              <strong>{e.event_type.replaceAll("_", " ")}</strong>{" "}
+              <span class="muted">
+                #{e.seq} · {e.created_at.slice(0, 19).replace("T", " ")} UTC
+              </span>
+            </p>
+            {trace ? (
+              <TraceTable trace={trace} />
+            ) : (
+              <pre style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:6px;padding:0.6rem;font-size:0.8rem;overflow-x:auto">
+                {JSON.stringify(payload, null, 2)}
+              </pre>
+            )}
+          </div>
+        );
+      })}
+      <p class="muted">
+        Every event above is hash-chained on the tamper-evident ledger; the{" "}
+        <a href="/dashboard/audit">audit page</a> re-verifies the full chain.
+      </p>
+    </Layout>
+  );
+});
+
+// ---------- Teams ----------
+
+dashboard.get("/dashboard/teams", async (c) => {
+  const orgId = c.get("orgId");
+  const org = await getOrg(c.env.DB, orgId);
+  const teams = await listTeams(c.env.DB, orgId);
+  const policy = await getActivePolicy(c.env.DB, orgId);
+  const isAdmin = c.get("role") === "admin";
+  return c.html(
+    <Layout title="Teams" orgName={org?.name}>
+      <h2>Teams</h2>
+      <p class="muted">
+        A team's agents share one budget, and its approvers receive the team's
+        approval requests. Team budgets live in the spend policy under{" "}
+        <code>budgets.teams</code>.
+      </p>
+      {isAdmin && (
+        <form method="post" action="/dashboard/teams" style="display:flex;gap:0.5rem;margin-bottom:1rem">
+          <input name="name" placeholder="Team name, e.g. research" required />
+          <button class="btn" style="background:#0f172a">Create team</button>
+        </form>
+      )}
+      <table>
+        <tr>
+          <th>Team</th>
+          <th>Agents</th>
+          <th>Daily budget</th>
+          <th>Monthly budget</th>
+        </tr>
+        {teams.map((t) => {
+          const limits = policy ? resolveTeamLimits(policy.rules, t.id) : undefined;
+          return (
+            <tr>
+              <td>
+                <a href={`/dashboard/teams/${t.id}`}>{t.name}</a>
+              </td>
+              <td>{t.agent_count}</td>
+              <td>{limits?.dailyCents !== undefined ? fmt(limits.dailyCents, policy?.rules.currency) : <span class="muted">—</span>}</td>
+              <td>{limits?.monthlyCents !== undefined ? fmt(limits.monthlyCents, policy?.rules.currency) : <span class="muted">—</span>}</td>
+            </tr>
+          );
+        })}
+      </table>
+    </Layout>
+  );
+});
+
+dashboard.post("/dashboard/teams", async (c) => {
+  const form = await c.req.formData();
+  const name = String(form.get("name") ?? "").trim();
+  if (!name) return c.text("name is required", 400);
+  const { teamId } = await createTeam(c.env.DB, { orgId: c.get("orgId"), name });
+  return c.redirect(`/dashboard/teams/${teamId}`);
+});
+
+dashboard.get("/dashboard/teams/:teamId", async (c) => {
+  const orgId = c.get("orgId");
+  const team = await getTeam(c.env.DB, orgId, c.req.param("teamId"));
+  if (!team) return c.text("No such team", 404);
+  const org = await getOrg(c.env.DB, orgId);
+  const policy = await getActivePolicy(c.env.DB, orgId);
+  const limits = policy ? resolveTeamLimits(policy.rules, team.id) : undefined;
+  const agents = await listTeamAgents(c.env.DB, team.id);
+  const approvers = await listTeamApprovers(c.env.DB, team.id);
+  const approverIds = new Set(approvers.map((a) => a.id));
+  const members = (await listMembers(c.env.DB, orgId)).filter(
+    (m) => m.role !== "viewer"
+  );
+  const knownAgents = await listKnownAgentIds(c.env.DB, orgId);
+  const isAdmin = c.get("role") === "admin";
+  return c.html(
+    <Layout title={`Team ${team.name}`} orgName={org?.name}>
+      <h2>Team: {team.name}</h2>
+
+      <h3>Agents</h3>
+      <p class="muted">
+        Each agent belongs to at most one team. Reassigning an agent moves its
+        future spend to the new team; spend already counted stays where it was.
+      </p>
+      {agents.length === 0 ? (
+        <p class="muted">No agents assigned.</p>
+      ) : (
+        <table style="margin-bottom:0.8rem">
+          {agents.map((a) => (
+            <tr>
+              <td>
+                <code>{a}</code>
+              </td>
+              <td>
+                {isAdmin && (
+                  <form method="post" action={`/dashboard/teams/${team.id}/agents`}>
+                    <input type="hidden" name="agent_id" value={a} />
+                    <input type="hidden" name="action" value="remove" />
+                    <button class="btn" style="background:#dc2626">Remove</button>
+                  </form>
+                )}
+              </td>
+            </tr>
+          ))}
+        </table>
+      )}
+      {isAdmin && (
+        <form method="post" action={`/dashboard/teams/${team.id}/agents`} style="display:flex;gap:0.5rem;margin-bottom:1.5rem">
+          <input name="agent_id" list="known-agents" placeholder="Agent id" required />
+          <datalist id="known-agents">
+            {knownAgents.map((a) => (
+              <option value={a} />
+            ))}
+          </datalist>
+          <input type="hidden" name="action" value="add" />
+          <button class="btn" style="background:#0f172a">Assign agent</button>
+        </form>
+      )}
+
+      <h3>Approvers</h3>
+      <p class="muted">
+        These members get this team's approval emails. With none set, requests
+        route to all org admins and approvers.
+      </p>
+      {isAdmin ? (
+        <form method="post" action={`/dashboard/teams/${team.id}/approvers`} style="margin-bottom:1.5rem">
+          {members.map((m) => (
+            <label style="display:block;margin-bottom:0.3rem">
+              <input
+                type="checkbox"
+                name="member_id"
+                value={m.id}
+                checked={approverIds.has(m.id)}
+              />{" "}
+              {m.email} <span class="muted">({m.role})</span>
+            </label>
+          ))}
+          <button class="btn" style="background:#0f172a">Save approvers</button>
+        </form>
+      ) : (
+        <p style="margin-bottom:1.5rem">
+          {approvers.length === 0 ? (
+            <span class="muted">None (org-wide routing)</span>
+          ) : (
+            approvers.map((a) => a.email).join(", ")
+          )}
+        </p>
+      )}
+
+      <h3>Shared budget</h3>
+      <p class="muted">
+        Saving writes a new policy version with{" "}
+        <code>budgets.teams["{team.id}"]</code>. Blank means no limit.
+      </p>
+      {isAdmin ? (
+        <form method="post" action={`/dashboard/teams/${team.id}/budget`} style="display:flex;gap:0.5rem">
+          <input
+            name="daily_cents"
+            type="number"
+            min="0"
+            placeholder="Daily (cents)"
+            value={limits?.dailyCents !== undefined ? String(limits.dailyCents) : ""}
+          />
+          <input
+            name="monthly_cents"
+            type="number"
+            min="0"
+            placeholder="Monthly (cents)"
+            value={limits?.monthlyCents !== undefined ? String(limits.monthlyCents) : ""}
+          />
+          <button class="btn" style="background:#0f172a">Save budget</button>
+        </form>
+      ) : (
+        <p>
+          daily: {limits?.dailyCents !== undefined ? fmt(limits.dailyCents, policy?.rules.currency) : "—"}, monthly:{" "}
+          {limits?.monthlyCents !== undefined ? fmt(limits.monthlyCents, policy?.rules.currency) : "—"}
+        </p>
+      )}
+    </Layout>
+  );
+});
+
+dashboard.post("/dashboard/teams/:teamId/agents", async (c) => {
+  const orgId = c.get("orgId");
+  const team = await getTeam(c.env.DB, orgId, c.req.param("teamId"));
+  if (!team) return c.text("No such team", 404);
+  const form = await c.req.formData();
+  const agentId = String(form.get("agent_id") ?? "").trim();
+  if (!agentId) return c.text("agent_id is required", 400);
+  await setAgentTeam(c.env.DB, {
+    orgId,
+    agentId,
+    teamId: form.get("action") === "remove" ? null : team.id,
+  });
+  return c.redirect(`/dashboard/teams/${team.id}`);
+});
+
+dashboard.post("/dashboard/teams/:teamId/approvers", async (c) => {
+  const orgId = c.get("orgId");
+  const team = await getTeam(c.env.DB, orgId, c.req.param("teamId"));
+  if (!team) return c.text("No such team", 404);
+  const form = await c.req.formData();
+  const selected = new Set(form.getAll("member_id").map(String));
+  // Only non-viewer members of this org may be team approvers.
+  const eligible = (await listMembers(c.env.DB, orgId)).filter(
+    (m) => m.role !== "viewer"
+  );
+  for (const member of eligible) {
+    await setTeamApprover(c.env.DB, {
+      teamId: team.id,
+      memberId: member.id,
+      on: selected.has(member.id),
+    });
+  }
+  return c.redirect(`/dashboard/teams/${team.id}`);
+});
+
+dashboard.post("/dashboard/teams/:teamId/budget", async (c) => {
+  const orgId = c.get("orgId");
+  const team = await getTeam(c.env.DB, orgId, c.req.param("teamId"));
+  if (!team) return c.text("No such team", 404);
+  const policy = await getActivePolicy(c.env.DB, orgId);
+  if (!policy) return c.text("No policy configured", 400);
+  const form = await c.req.formData();
+  const parse = (v: unknown) => {
+    const s = String(v ?? "").trim();
+    if (!s) return undefined;
+    const n = Number(s);
+    return Number.isInteger(n) && n >= 0 ? n : null;
+  };
+  const daily = parse(form.get("daily_cents"));
+  const monthly = parse(form.get("monthly_cents"));
+  if (daily === null || monthly === null) {
+    return c.text("Budgets must be non-negative integer cents.", 400);
+  }
+
+  const rules = { ...policy.rules };
+  rules.budgets = { ...rules.budgets, teams: { ...rules.budgets?.teams } };
+  if (daily === undefined && monthly === undefined) {
+    delete rules.budgets.teams![team.id];
+  } else {
+    rules.budgets.teams![team.id] = {
+      ...(daily !== undefined ? { dailyCents: daily } : {}),
+      ...(monthly !== undefined ? { monthlyCents: monthly } : {}),
+    };
+  }
+  const { version } = await insertPolicy(c.env.DB, { orgId, rules });
+  await c.env.ORG.getByName(orgId).appendEvent({
+    orgId,
+    requestId: "policy",
+    eventType: "policy_updated",
+    payload: { version, editedBy: c.get("email"), via: "teams_page", teamId: team.id },
+  });
+  return c.redirect(`/dashboard/teams/${team.id}`);
+});
+
+dashboard.get("/dashboard/members", async (c) => {
+  const orgId = c.get("orgId");
+  const org = await getOrg(c.env.DB, orgId);
+  const members = await listMembers(c.env.DB, orgId);
+  const isAdmin = c.get("role") === "admin";
+  const error = c.req.query("error");
+  return c.html(
+    <Layout title="Members" orgName={org?.name}>
+      <h2>Members</h2>
+      <p class="muted">
+        Admins manage policy, keys, teams, and members. Approvers decide
+        pending purchases. Viewers have read-only access.
+      </p>
+      {error && <p style="color:#dc2626">{error}</p>}
+      {isAdmin && (
+        <form method="post" action="/dashboard/members" style="display:flex;gap:0.5rem;margin-bottom:1rem">
+          <input name="email" type="email" placeholder="person@company.com" required />
+          <select name="role">
+            {MEMBER_ROLES.map((r) => (
+              <option value={r}>{r}</option>
+            ))}
+          </select>
+          <button class="btn" style="background:#0f172a">Add member</button>
+        </form>
+      )}
+      <table>
+        <tr>
+          <th>Email</th>
+          <th>Role</th>
+          <th>Added (UTC)</th>
+          {isAdmin && <th />}
+        </tr>
+        {members.map((m) => (
+          <tr>
+            <td>{m.email}</td>
+            <td>
+              {isAdmin ? (
+                <form method="post" action="/dashboard/members" style="display:flex;gap:0.4rem">
+                  <input type="hidden" name="email" value={m.email} />
+                  <select name="role">
+                    {MEMBER_ROLES.map((r) => (
+                      <option value={r} selected={r === m.role}>
+                        {r}
+                      </option>
+                    ))}
+                  </select>
+                  <button class="btn" style="background:#0f172a">Set</button>
+                </form>
+              ) : (
+                m.role
+              )}
+            </td>
+            <td>{m.created_at.slice(0, 16).replace("T", " ")}</td>
+            {isAdmin && (
+              <td>
+                <form method="post" action="/dashboard/members/delete">
+                  <input type="hidden" name="member_id" value={m.id} />
+                  <button class="btn" style="background:#dc2626">Remove</button>
+                </form>
+              </td>
+            )}
+          </tr>
+        ))}
+      </table>
+    </Layout>
+  );
+});
+
+dashboard.post("/dashboard/members", async (c) => {
+  const orgId = c.get("orgId");
+  const form = await c.req.formData();
+  const email = String(form.get("email") ?? "").trim();
+  const role = String(form.get("role") ?? "") as MemberRole;
+  if (!email || !MEMBER_ROLES.includes(role)) {
+    return c.text("email and a valid role are required", 400);
+  }
+  // Demoting the last admin would lock everyone out of member management.
+  const existing = await getMembership(c.env.DB, orgId, email);
+  if (existing?.role === "admin" && role !== "admin") {
+    if ((await countAdmins(c.env.DB, orgId)) <= 1) {
+      return c.text("Cannot demote the last admin.", 400);
+    }
+  }
+  await upsertMember(c.env.DB, { orgId, email, role });
+  return c.redirect("/dashboard/members");
+});
+
+dashboard.post("/dashboard/members/delete", async (c) => {
+  const orgId = c.get("orgId");
+  const form = await c.req.formData();
+  const memberId = String(form.get("member_id") ?? "");
+  const member = await getMemberById(c.env.DB, orgId, memberId);
+  if (!member) return c.redirect("/dashboard/members");
+  if (member.role === "admin" && (await countAdmins(c.env.DB, orgId)) <= 1) {
+    return c.text("Cannot remove the last admin.", 400);
+  }
+  await deleteMember(c.env.DB, orgId, memberId);
+  return c.redirect("/dashboard/members");
 });
 
 dashboard.get("/dashboard/audit", async (c) => {

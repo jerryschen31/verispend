@@ -60,6 +60,8 @@ export type PolicyRules = {
     perAgent?: BudgetLimits;
     /** Per-agent overrides, keyed by agent id. */
     agents?: Record<string, BudgetLimits>;
+    /** Shared limits across all agents of a team, keyed by team id. */
+    teams?: Record<string, BudgetLimits>;
   };
   /** Purchases matching these need a human decision instead of auto-approval. */
   escalation?: { amountCents?: number; categories?: string[] };
@@ -83,100 +85,230 @@ export type StaticDecision =
   | { decision: "denied"; ruleFired: string; reason: string }
   | { decision: "pending_approval"; ruleFired: string; reason: string };
 
+/**
+ * One rule evaluation in a decision's explanation. `rule` uses the same slug
+ * as ruleFired, so the triggered entry always matches the decision.
+ */
+export type TraceEntry = {
+  rule: string;
+  result: "pass" | "triggered" | "skipped";
+  detail?: string;
+};
+
+/** A decision plus the full evaluation trace — explainable approvals too. */
+export type EvaluatedDecision = StaticDecision & { trace: TraceEntry[] };
+
 export const norm = (s: string) => s.trim().toLowerCase();
 
 const includesNorm = (list: string[] | undefined, value: string) =>
   (list ?? []).some((item) => norm(item) === norm(value));
 
+type CheckOutcome =
+  | { result: "pass"; detail?: string }
+  | { result: "skipped"; detail: string }
+  | { result: "triggered"; decision: StaticDecision };
+
+const NOT_CONFIGURED: CheckOutcome = {
+  result: "skipped",
+  detail: "not configured",
+};
+
 export function evaluatePolicy(
   rules: PolicyRules,
   intent: PurchaseIntent
-): StaticDecision {
-  if (!Number.isInteger(intent.amountCents) || intent.amountCents <= 0) {
-    return {
-      decision: "denied",
-      ruleFired: "invalid_amount",
-      reason: `Amount must be a positive integer of cents, got ${intent.amountCents}.`,
-    };
+): EvaluatedDecision {
+  const checks: Array<[rule: string, run: () => CheckOutcome]> = [
+    [
+      "invalid_amount",
+      () =>
+        !Number.isInteger(intent.amountCents) || intent.amountCents <= 0
+          ? {
+              result: "triggered",
+              decision: {
+                decision: "denied",
+                ruleFired: "invalid_amount",
+                reason: `Amount must be a positive integer of cents, got ${intent.amountCents}.`,
+              },
+            }
+          : { result: "pass", detail: `${intent.amountCents}¢ is a valid amount` },
+    ],
+    [
+      "currency_mismatch",
+      () =>
+        norm(intent.currency) !== norm(rules.currency)
+          ? {
+              result: "triggered",
+              decision: {
+                decision: "denied",
+                ruleFired: "currency_mismatch",
+                reason: `Policy is denominated in ${rules.currency}; purchase is in ${intent.currency}.`,
+              },
+            }
+          : { result: "pass", detail: `currency ${intent.currency} matches policy` },
+    ],
+    [
+      "vendor_denied",
+      () => {
+        if (!rules.vendors?.deny?.length) return NOT_CONFIGURED;
+        return includesNorm(rules.vendors.deny, intent.vendor)
+          ? {
+              result: "triggered",
+              decision: {
+                decision: "denied",
+                ruleFired: "vendor_denied",
+                reason: `Vendor "${intent.vendor}" is on the deny list.`,
+              },
+            }
+          : {
+              result: "pass",
+              detail: `vendor "${intent.vendor}" is not on the deny list (${rules.vendors.deny.length} entries)`,
+            };
+      },
+    ],
+    [
+      "vendor_not_allowed",
+      () => {
+        if (!rules.vendors?.allow?.length) return NOT_CONFIGURED;
+        return !includesNorm(rules.vendors.allow, intent.vendor)
+          ? {
+              result: "triggered",
+              decision: {
+                decision: "denied",
+                ruleFired: "vendor_not_allowed",
+                reason: `Vendor "${intent.vendor}" is not on the allow list.`,
+              },
+            }
+          : {
+              result: "pass",
+              detail: `vendor "${intent.vendor}" is on the allow list`,
+            };
+      },
+    ],
+    [
+      "category_denied",
+      () => {
+        if (!rules.categories?.deny?.length) return NOT_CONFIGURED;
+        return includesNorm(rules.categories.deny, intent.category)
+          ? {
+              result: "triggered",
+              decision: {
+                decision: "denied",
+                ruleFired: "category_denied",
+                reason: `Category "${intent.category}" is on the deny list.`,
+              },
+            }
+          : {
+              result: "pass",
+              detail: `category "${intent.category}" is not on the deny list (${rules.categories.deny.length} entries)`,
+            };
+      },
+    ],
+    [
+      "category_not_allowed",
+      () => {
+        if (!rules.categories?.allow?.length) return NOT_CONFIGURED;
+        return !includesNorm(rules.categories.allow, intent.category)
+          ? {
+              result: "triggered",
+              decision: {
+                decision: "denied",
+                ruleFired: "category_not_allowed",
+                reason: `Category "${intent.category}" is not on the allow list.`,
+              },
+            }
+          : {
+              result: "pass",
+              detail: `category "${intent.category}" is on the allow list`,
+            };
+      },
+    ],
+    [
+      "over_transaction_cap",
+      () => {
+        if (rules.maxPerTransactionCents === undefined) return NOT_CONFIGURED;
+        return intent.amountCents > rules.maxPerTransactionCents
+          ? {
+              result: "triggered",
+              decision: {
+                decision: "denied",
+                ruleFired: "over_transaction_cap",
+                reason: `Amount ${intent.amountCents}¢ exceeds the per-transaction cap of ${rules.maxPerTransactionCents}¢.`,
+              },
+            }
+          : {
+              result: "pass",
+              detail: `${intent.amountCents}¢ is within the ${rules.maxPerTransactionCents}¢ per-transaction cap`,
+            };
+      },
+    ],
+    [
+      "escalation_category",
+      () => {
+        if (!rules.escalation?.categories?.length) return NOT_CONFIGURED;
+        return includesNorm(rules.escalation.categories, intent.category)
+          ? {
+              result: "triggered",
+              decision: {
+                decision: "pending_approval",
+                ruleFired: "escalation_category",
+                reason: `Category "${intent.category}" requires human approval.`,
+              },
+            }
+          : {
+              result: "pass",
+              detail: `category "${intent.category}" does not require escalation`,
+            };
+      },
+    ],
+    [
+      "escalation_amount",
+      () => {
+        if (rules.escalation?.amountCents === undefined) return NOT_CONFIGURED;
+        return intent.amountCents >= rules.escalation.amountCents
+          ? {
+              result: "triggered",
+              decision: {
+                decision: "pending_approval",
+                ruleFired: "escalation_amount",
+                reason: `Amount ${intent.amountCents}¢ meets the human-approval threshold of ${rules.escalation.amountCents}¢.`,
+              },
+            }
+          : {
+              result: "pass",
+              detail: `${intent.amountCents}¢ is below the ${rules.escalation.amountCents}¢ escalation threshold`,
+            };
+      },
+    ],
+  ];
+
+  const trace: TraceEntry[] = [];
+  let decision: StaticDecision | null = null;
+  for (const [rule, run] of checks) {
+    if (decision) {
+      trace.push({
+        rule,
+        result: "skipped",
+        detail: "skipped: decision already made",
+      });
+      continue;
+    }
+    const outcome = run();
+    if (outcome.result === "triggered") {
+      decision = outcome.decision;
+      trace.push({
+        rule,
+        result: "triggered",
+        detail: "reason" in outcome.decision ? outcome.decision.reason : undefined,
+      });
+    } else {
+      trace.push({ rule, result: outcome.result, detail: outcome.detail });
+    }
   }
 
-  if (norm(intent.currency) !== norm(rules.currency)) {
-    return {
-      decision: "denied",
-      ruleFired: "currency_mismatch",
-      reason: `Policy is denominated in ${rules.currency}; purchase is in ${intent.currency}.`,
-    };
-  }
-
-  if (includesNorm(rules.vendors?.deny, intent.vendor)) {
-    return {
-      decision: "denied",
-      ruleFired: "vendor_denied",
-      reason: `Vendor "${intent.vendor}" is on the deny list.`,
-    };
-  }
-
-  if (
-    rules.vendors?.allow?.length &&
-    !includesNorm(rules.vendors.allow, intent.vendor)
-  ) {
-    return {
-      decision: "denied",
-      ruleFired: "vendor_not_allowed",
-      reason: `Vendor "${intent.vendor}" is not on the allow list.`,
-    };
-  }
-
-  if (includesNorm(rules.categories?.deny, intent.category)) {
-    return {
-      decision: "denied",
-      ruleFired: "category_denied",
-      reason: `Category "${intent.category}" is on the deny list.`,
-    };
-  }
-
-  if (
-    rules.categories?.allow?.length &&
-    !includesNorm(rules.categories.allow, intent.category)
-  ) {
-    return {
-      decision: "denied",
-      ruleFired: "category_not_allowed",
-      reason: `Category "${intent.category}" is not on the allow list.`,
-    };
-  }
-
-  if (
-    rules.maxPerTransactionCents !== undefined &&
-    intent.amountCents > rules.maxPerTransactionCents
-  ) {
-    return {
-      decision: "denied",
-      ruleFired: "over_transaction_cap",
-      reason: `Amount ${intent.amountCents}¢ exceeds the per-transaction cap of ${rules.maxPerTransactionCents}¢.`,
-    };
-  }
-
-  if (includesNorm(rules.escalation?.categories, intent.category)) {
-    return {
-      decision: "pending_approval",
-      ruleFired: "escalation_category",
-      reason: `Category "${intent.category}" requires human approval.`,
-    };
-  }
-
-  if (
-    rules.escalation?.amountCents !== undefined &&
-    intent.amountCents >= rules.escalation.amountCents
-  ) {
-    return {
-      decision: "pending_approval",
-      ruleFired: "escalation_amount",
-      reason: `Amount ${intent.amountCents}¢ meets the human-approval threshold of ${rules.escalation.amountCents}¢.`,
-    };
-  }
-
-  return { decision: "approved", ruleFired: "within_policy" };
+  return {
+    ...(decision ?? { decision: "approved", ruleFired: "within_policy" }),
+    trace,
+  };
 }
 
 export function resolveAgentLimits(
@@ -188,6 +320,14 @@ export function resolveAgentLimits(
 
 export function resolveOrgLimits(rules: PolicyRules): BudgetLimits | undefined {
   return rules.budgets?.org;
+}
+
+export function resolveTeamLimits(
+  rules: PolicyRules,
+  teamId: string | null | undefined
+): BudgetLimits | undefined {
+  if (!teamId) return undefined;
+  return rules.budgets?.teams?.[teamId];
 }
 
 export const DEFAULT_POLICY: PolicyRules = {

@@ -5,19 +5,56 @@ import {
   getActivePolicy,
   getOrg,
   getPurchaseRequest,
+  getTeamForAgent,
+  insertDecisionToken,
   insertPurchaseRequest,
   insertUsageRecord,
   markOutcomeRecorded,
+  type TeamRow,
 } from "./db";
-import { sendApprovalEmail, sendBreakerAlertEmail } from "./approvals";
+import {
+  resolveApprovers,
+  sendApprovalEmail,
+  sendBreakerAlertEmail,
+} from "./approvals";
 import {
   evaluatePolicy,
   resolveAgentLimits,
   resolveBreakerRules,
   resolveOrgLimits,
+  resolveTeamLimits,
+  type EvaluatedDecision,
   type PurchaseIntent,
-  type StaticDecision,
+  type TraceEntry,
 } from "./policy";
+import type { BudgetCheck } from "./org-do";
+
+/** Budget checks rendered as trace entries, so approvals explain their math. */
+const budgetTrace = (
+  checks: BudgetCheck[],
+  failed?: { scope: string; period: string; reason: string }
+): TraceEntry[] =>
+  checks.map((c) => {
+    const rule = `budget_${c.scope}_${c.period}`;
+    if (failed && c.scope === failed.scope && c.period === failed.period) {
+      return { rule, result: "triggered", detail: failed.reason };
+    }
+    return {
+      rule,
+      result: "pass",
+      detail: `${c.scope} "${c.scopeId}" ${c.period}: ${c.usedCents}¢ used of ${c.limitCents}¢`,
+    };
+  });
+
+/** Human-readable name for the budget scope that rejected a reserve. */
+const scopeLabel = (
+  scope: "agent" | "team" | "org",
+  period: "daily" | "monthly",
+  team: TeamRow | null
+) =>
+  scope === "team"
+    ? `team "${team?.name ?? "unknown"}" ${period}`
+    : `${scope} ${period}`;
 
 // Set by the auth layer in index.ts before the request reaches the agent.
 export type Props = {
@@ -104,40 +141,72 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           breakerRules: resolveBreakerRules(policy.rules),
         });
 
-        let decision: StaticDecision;
+        let decision: EvaluatedDecision;
         if (breaker.status === "frozen") {
+          const reason =
+            `This agent is frozen by the circuit breaker (since ${breaker.frozenAt}): ` +
+            `${breaker.reason} A human must unfreeze it in the VeriSpend dashboard.`;
           decision = {
             decision: "denied",
             ruleFired: "agent_frozen",
-            reason:
-              `This agent is frozen by the circuit breaker (since ${breaker.frozenAt}): ` +
-              `${breaker.reason} A human must unfreeze it in the VeriSpend dashboard.`,
+            reason,
+            trace: [{ rule: "agent_frozen", result: "triggered", detail: reason }],
           };
         } else if (breaker.status === "tripped") {
+          const reason = `Circuit breaker tripped (${breaker.signal.replaceAll("_", " ")}): ${breaker.reason}`;
           decision = {
             decision: "denied",
             ruleFired: "circuit_breaker",
-            reason: `Circuit breaker tripped (${breaker.signal.replaceAll("_", " ")}): ${breaker.reason}`,
+            reason,
+            trace: [{ rule: "circuit_breaker", result: "triggered", detail: reason }],
           };
         } else {
           decision = evaluatePolicy(policy.rules, intent);
         }
+        const team = await getTeamForAgent(db, orgId, agentId);
+        let budgetDenied: {
+          scope: string;
+          scope_id: string;
+          period: string;
+          limit_cents: number;
+          used_cents: number;
+        } | null = null;
         if (decision.decision === "approved") {
           const reserve = await org().reserve({
             agentId,
             amountCents: amount_cents,
             orgLimits: resolveOrgLimits(policy.rules),
             agentLimits: resolveAgentLimits(policy.rules, agentId),
+            teamId: team?.id,
+            teamLimits: resolveTeamLimits(policy.rules, team?.id),
           });
           if (!reserve.ok) {
+            const reason =
+              `Budget exceeded (${scopeLabel(reserve.scope, reserve.period, team)}): ` +
+              `${reserve.usedCents}¢ of ${reserve.limitCents}¢ already used; ` +
+              `this purchase of ${amount_cents}¢ does not fit.`;
+            budgetDenied = {
+              scope: reserve.scope,
+              scope_id: reserve.scopeId,
+              period: reserve.period,
+              limit_cents: reserve.limitCents,
+              used_cents: reserve.usedCents,
+            };
             decision = {
               decision: "denied",
               ruleFired: `budget_${reserve.exceeded}`,
-              reason:
-                `Budget exceeded (${reserve.exceeded.replaceAll("_", " ")}): ` +
-                `${reserve.usedCents}¢ of ${reserve.limitCents}¢ already used; ` +
-                `this purchase of ${amount_cents}¢ does not fit.`,
+              reason,
+              trace: [
+                ...decision.trace,
+                ...budgetTrace(reserve.checks, {
+                  scope: reserve.scope,
+                  period: reserve.period,
+                  reason,
+                }),
+              ],
             };
+          } else {
+            decision.trace.push(...budgetTrace(reserve.checks));
           }
         }
 
@@ -145,7 +214,6 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
         const approvalRef =
           decision.decision === "approved" ? `apr_${crypto.randomUUID()}` : null;
         const decidedNow = decision.decision !== "pending_approval";
-        const decisionToken = decidedNow ? null : `dt_${crypto.randomUUID()}`;
 
         await insertPurchaseRequest(db, {
           id: requestId,
@@ -162,15 +230,28 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           denial_reason: decision.decision === "denied" ? decision.reason : null,
           approval_ref: approvalRef,
           decided_at: decidedNow ? new Date().toISOString() : null,
-          decision_token: decisionToken,
+          decision_token: null, // per-recipient tokens live in decision_tokens
+          // Pin the team the budget was reserved against so a later outcome
+          // corrects the right counter. Pending reservations happen at
+          // approval time, so their team is recorded there instead.
+          team_id: decision.decision === "approved" ? team?.id ?? null : null,
         });
 
-        if (decisionToken) {
+        let routed: { emails: string[]; source: string } | null = null;
+        if (!decidedNow) {
+          routed = await resolveApprovers(db, orgId, agentId);
           const orgRow = await getOrg(db, orgId);
-          if (orgRow?.approver_email) {
+          for (const email of routed.emails) {
+            const token = `dt_${crypto.randomUUID()}`;
+            await insertDecisionToken(db, {
+              token,
+              orgId,
+              requestId,
+              recipientEmail: email,
+            });
             await sendApprovalEmail(this.env, {
-              approverEmail: orgRow.approver_email,
-              orgName: orgRow.name,
+              approverEmail: email,
+              orgName: orgRow?.name ?? "your org",
               row: {
                 agent_id: agentId,
                 vendor,
@@ -179,7 +260,7 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
                 category,
                 justification,
               },
-              decisionToken,
+              decisionToken: token,
             });
           }
         }
@@ -200,8 +281,17 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
             reason: "reason" in decision ? decision.reason : null,
             policyVersion: policy.version,
             approvalRef,
+            trace: decision.trace,
           },
         });
+        if (routed) {
+          await org().appendEvent({
+            orgId,
+            requestId,
+            eventType: "approval_routed",
+            payload: { recipients: routed.emails, source: routed.source },
+          });
+        }
 
         if (breaker.status === "tripped") {
           await org().appendEvent({
@@ -216,10 +306,11 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
             },
           });
           const orgRow = await getOrg(db, orgId);
-          if (orgRow?.approver_email) {
+          const alertTo = await resolveApprovers(db, orgId, agentId);
+          for (const email of alertTo.emails) {
             await sendBreakerAlertEmail(this.env, {
-              approverEmail: orgRow.approver_email,
-              orgName: orgRow.name,
+              approverEmail: email,
+              orgName: orgRow?.name ?? "your org",
               agentId,
               signal: breaker.signal,
               reason: breaker.reason,
@@ -232,6 +323,8 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           status: decision.decision,
           rule_fired: decision.ruleFired,
           reason: "reason" in decision ? decision.reason : undefined,
+          trace: decision.trace,
+          budget: budgetDenied ?? undefined,
           approval_ref: approvalRef ?? undefined,
           next_step:
             decision.decision === "approved"
@@ -305,7 +398,14 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
 
         const deltaCents = final_amount_cents - row.amount_cents;
         if (deltaCents !== 0) {
-          await org().adjust({ agentId: row.agent_id, deltaCents });
+          // Correct the counter on the team the reservation actually hit
+          // (persisted at decision time), not the agent's current team — the
+          // agent may have been reassigned since.
+          await org().adjust({
+            agentId: row.agent_id,
+            deltaCents,
+            teamId: row.team_id ?? undefined,
+          });
         }
 
         const outcomeJson = receipt ? JSON.stringify({ receipt }) : null;
@@ -381,8 +481,9 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
 
         // Usage already happened, so it can't be blocked — but it consumes
         // budget headroom so future purchases and dashboards see it.
+        const team = await getTeamForAgent(db, orgId, agentId);
         if (expected_cost_cents > 0) {
-          await org().adjust({ agentId, deltaCents: expected_cost_cents });
+          await org().adjust({ agentId, deltaCents: expected_cost_cents, teamId: team?.id });
         }
         await org().appendEvent({
           orgId,
@@ -391,9 +492,10 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           payload: { agentId, vendor, metric, units, expectedCostCents: expected_cost_cents, note: note ?? null },
         });
 
-        const usage = await org().usage({ agentId });
+        const usage = await org().usage({ agentId, teamId: team?.id });
         const agentLimits = resolveAgentLimits(policy.rules, agentId);
         const orgLimits = resolveOrgLimits(policy.rules);
+        const teamLimits = resolveTeamLimits(policy.rules, team?.id);
         const overruns = [
           agentLimits?.dailyCents !== undefined &&
             usage.agentDailyCents > agentLimits.dailyCents &&
@@ -401,6 +503,12 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           agentLimits?.monthlyCents !== undefined &&
             usage.agentMonthlyCents > agentLimits.monthlyCents &&
             "agent monthly budget exceeded",
+          teamLimits?.dailyCents !== undefined &&
+            usage.teamDailyCents > teamLimits.dailyCents &&
+            `team "${team?.name}" daily budget exceeded`,
+          teamLimits?.monthlyCents !== undefined &&
+            usage.teamMonthlyCents > teamLimits.monthlyCents &&
+            `team "${team?.name}" monthly budget exceeded`,
           orgLimits?.dailyCents !== undefined &&
             usage.orgDailyCents > orgLimits.dailyCents &&
             "org daily budget exceeded",
@@ -433,10 +541,12 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
       async () => {
         const policy = await getActivePolicy(db, orgId);
         if (!policy) return jsonError("No spend policy configured for this org.");
-        const usage = await org().usage({ agentId });
+        const team = await getTeamForAgent(db, orgId, agentId);
+        const usage = await org().usage({ agentId, teamId: team?.id });
         const frozen = await org().isFrozen({ agentId });
         const agentLimits = resolveAgentLimits(policy.rules, agentId);
         const orgLimits = resolveOrgLimits(policy.rules);
+        const teamLimits = resolveTeamLimits(policy.rules, team?.id);
         return json({
           agent_id: agentId,
           frozen: frozen.frozen,
@@ -448,6 +558,16 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
             monthly_used_cents: usage.agentMonthlyCents,
             monthly_limit_cents: agentLimits?.monthlyCents ?? null,
           },
+          team: team
+            ? {
+                id: team.id,
+                name: team.name,
+                daily_used_cents: usage.teamDailyCents,
+                daily_limit_cents: teamLimits?.dailyCents ?? null,
+                monthly_used_cents: usage.teamMonthlyCents,
+                monthly_limit_cents: teamLimits?.monthlyCents ?? null,
+              }
+            : null,
           org: {
             daily_used_cents: usage.orgDailyCents,
             daily_limit_cents: orgLimits?.dailyCents ?? null,

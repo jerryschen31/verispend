@@ -8,6 +8,7 @@
 export type LedgerEventType =
   | "purchase_requested"
   | "auto_decision"
+  | "approval_routed"
   | "human_decision"
   | "outcome_recorded"
   | "policy_updated"
