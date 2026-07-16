@@ -21,6 +21,7 @@ import {
 import type { BudgetLimits } from "./policy";
 import { buildAuditBundle, exportPurchasesCsv } from "./export";
 import { ingestBill } from "./reconcile";
+import { ingestSettlement } from "./settlements";
 import { MANDATE_ALGS, MANDATE_SCHEMES } from "./mandate";
 import { DEFAULT_POLICY, type PolicyRules } from "./policy";
 import { VeriSpendMCP } from "./mcp";
@@ -290,6 +291,54 @@ app.post("/api/admin/orgs/:orgId/bills", async (c) => {
     variance_cents: result.bill.variance_cents,
     recon_status: result.bill.recon_status,
   });
+});
+
+// Settlement ingestion (Phase 3): rails and finance systems push settlement
+// confirmations here; VeriSpend never pulls them. Accepts one record or a
+// batch. The dashboard form at /dashboard/settlements is the session-guarded
+// equivalent.
+app.post("/api/admin/orgs/:orgId/settlements", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  if (!(await getOrg(c.env.DB, orgId))) {
+    return c.json({ error: "no such org" }, 404);
+  }
+  const body = await c.req.json<
+    { rail?: string; settlements?: Array<Record<string, unknown>> } & Record<
+      string,
+      unknown
+    >
+  >();
+  if (typeof body.rail !== "string") {
+    return c.json({ error: "rail is required" }, 400);
+  }
+  const payloads = Array.isArray(body.settlements)
+    ? body.settlements
+    : [body as Record<string, unknown>];
+  const results = [];
+  for (const payload of payloads) {
+    const result = await ingestSettlement(c.env, {
+      orgId,
+      rail: body.rail,
+      payload,
+      enteredBy: "admin-api",
+    });
+    results.push(
+      result.ok
+        ? {
+            settlement_id: result.settlement.id,
+            match_status: result.settlement.match_status,
+            match_method: result.settlement.match_method,
+            matched_request_id: result.settlement.matched_request_id,
+            variance_cents: result.settlement.variance_cents,
+            duplicate: result.duplicate,
+          }
+        : { error: result.error }
+    );
+  }
+  return c.json({ results });
 });
 
 // Admin-key twins of the dashboard exports, for the simulator and CI (no

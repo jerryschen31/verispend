@@ -232,6 +232,92 @@ export async function sendReconciliationAlertEmail(
   }
 }
 
+export async function sendSettlementMismatchEmail(
+  env: Env,
+  args: {
+    approverEmail: string;
+    orgName: string;
+    rail: string;
+    settlementRef: string;
+    vendor: string;
+    settledCents: number;
+    varianceCents: number;
+    requestId: string;
+    currency: string;
+  }
+): Promise<void> {
+  const text = [
+    `A ${args.rail} settlement at ${args.orgName} does not match what was authorized.`,
+    ``,
+    `Vendor:     ${args.vendor}`,
+    `Settled:    ${fmt(args.settledCents, args.currency)} (ref ${args.settlementRef})`,
+    `Variance:   ${fmt(args.varianceCents, args.currency)} vs the matched purchase`,
+    `Purchase:   ${env.BASE_URL}/dashboard/requests/${args.requestId}`,
+    ``,
+    `Review: ${env.BASE_URL}/dashboard/settlements`,
+  ].join("\n");
+
+  try {
+    await env.EMAIL.send({
+      to: args.approverEmail,
+      from: { email: env.EMAIL_FROM, name: "VeriSpend Alerts" },
+      subject: `Settlement mismatch: ${args.vendor} settled ${fmt(args.settledCents, args.currency)} (${fmt(args.varianceCents, args.currency)} off)`,
+      text,
+    });
+  } catch (error) {
+    console.log(
+      JSON.stringify({
+        event: "settlement_mismatch_email_failed",
+        error: error instanceof Error ? error.message : String(error),
+      })
+    );
+  }
+}
+
+export async function sendUnauthorizedChargeEmail(
+  env: Env,
+  args: {
+    approverEmail: string;
+    orgName: string;
+    rail: string;
+    settlementRef: string;
+    vendor: string;
+    amountCents: number;
+    occurredAt: string;
+    currency: string;
+  }
+): Promise<void> {
+  const text = [
+    `A ${args.rail} charge at ${args.orgName} matches no authorized purchase.`,
+    ``,
+    `Vendor:   ${args.vendor}`,
+    `Amount:   ${fmt(args.amountCents, args.currency)}`,
+    `When:     ${args.occurredAt}`,
+    `Ref:      ${args.settlementRef}`,
+    ``,
+    `No agent requested this and no approval covers it. If it is not a`,
+    `purchase made outside VeriSpend, treat it as an unauthorized charge.`,
+    ``,
+    `Review: ${env.BASE_URL}/dashboard/settlements`,
+  ].join("\n");
+
+  try {
+    await env.EMAIL.send({
+      to: args.approverEmail,
+      from: { email: env.EMAIL_FROM, name: "VeriSpend Alerts" },
+      subject: `Unauthorized charge: ${args.vendor} ${fmt(args.amountCents, args.currency)} on ${args.rail} matches no approval`,
+      text,
+    });
+  } catch (error) {
+    console.log(
+      JSON.stringify({
+        event: "unauthorized_charge_email_failed",
+        error: error instanceof Error ? error.message : String(error),
+      })
+    );
+  }
+}
+
 export type DecisionOutcome = {
   ok: boolean;
   title: string;

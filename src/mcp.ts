@@ -8,12 +8,16 @@ import {
   getTeamForAgent,
   insertDecisionToken,
   insertPaymentMandate,
+  getSettlementByRef,
   insertPurchaseRequest,
   insertUsageRecord,
   markOutcomeRecorded,
+  updateSettlementMatch,
   type TeamRow,
 } from "./db";
 import { verifyMandate, type MandateVerification } from "./mandate";
+import { classifyMatch } from "./settlements";
+import { resolveReconciliationRules } from "./reconcile";
 import {
   resolveApprovers,
   sendApprovalEmail,
@@ -461,9 +465,20 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
             .describe(
               "Optional receipt details: order id, confirmation number, line items"
             ),
+          rail: z
+            .enum(["card", "stablecoin", "checkout", "stripe_event", "other"])
+            .optional()
+            .describe("Payment rail the purchase settled on, if known"),
+          settlement_ref: z
+            .string()
+            .optional()
+            .describe(
+              "The rail's own transaction id — card auth code, tx hash, order " +
+                "id — so the later settlement record matches this purchase exactly"
+            ),
         },
       },
-      async ({ request_id, final_amount_cents, receipt }) => {
+      async ({ request_id, final_amount_cents, receipt, rail, settlement_ref }) => {
         const row = await getPurchaseRequest(db, orgId, request_id);
         if (!row) return jsonError(`No request ${request_id} for this org.`);
         if (row.status !== "approved") {
@@ -484,12 +499,21 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           });
         }
 
-        const outcomeJson = receipt ? JSON.stringify({ receipt }) : null;
+        const outcomeJson =
+          receipt || rail || settlement_ref
+            ? JSON.stringify({
+                receipt: receipt ?? null,
+                rail: rail ?? null,
+                settlement_ref: settlement_ref ?? null,
+              })
+            : null;
         await markOutcomeRecorded(db, {
           orgId,
           requestId: request_id,
           outcomeAmountCents: final_amount_cents,
           outcomeJson,
+          settlementRail: rail ?? null,
+          settlementRef: settlement_ref ?? null,
         });
         await org().appendEvent({
           orgId,
@@ -500,14 +524,58 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
             finalAmountCents: final_amount_cents,
             deltaCents,
             receipt: receipt ?? null,
+            rail: rail ?? null,
+            settlementRef: settlement_ref ?? null,
           },
         });
+
+        // Late-match pass: the rail's settlement record may have landed before
+        // the agent reported. If an unmatched (or mismatched) settlement with
+        // this exact ref exists, re-point it at this purchase now.
+        let rematched: { settlement_id: string; match_status: string } | null = null;
+        if (rail && settlement_ref) {
+          const settlement = await getSettlementByRef(db, orgId, rail, settlement_ref);
+          if (settlement && settlement.matched_request_id !== request_id) {
+            const policy = await getActivePolicy(db, orgId);
+            const tolerance = resolveReconciliationRules(
+              policy?.rules.reconciliation
+            );
+            const { status, varianceCents } = classifyMatch({
+              settledCents: settlement.amount_cents,
+              referenceCents: final_amount_cents,
+              tolerance,
+            });
+            await updateSettlementMatch(db, {
+              orgId,
+              settlementId: settlement.id,
+              matchStatus: status,
+              matchMethod: "settlement_ref",
+              matchedRequestId: request_id,
+              varianceCents,
+            });
+            await org().appendEvent({
+              orgId,
+              requestId: settlement.id,
+              eventType: "settlement_matched",
+              payload: {
+                status,
+                method: "settlement_ref",
+                matchedRequestId: request_id,
+                varianceCents,
+                tolerance,
+                rematch: true,
+              },
+            });
+            rematched = { settlement_id: settlement.id, match_status: status };
+          }
+        }
 
         return json({
           request_id,
           status: "completed",
           final_amount_cents,
           variance_from_approval_cents: deltaCents,
+          settlement_match: rematched ?? undefined,
         });
       }
     );

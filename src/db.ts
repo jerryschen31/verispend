@@ -29,6 +29,9 @@ export type PurchaseRequestRow = {
   outcome_json: string | null;
   /** Team whose shared budget this purchase was reserved against, if any. */
   team_id: string | null;
+  /** Rail and rail-native reference the agent reported at record_outcome. */
+  settlement_rail: string | null;
+  settlement_ref: string | null;
   created_at: string;
 };
 
@@ -446,7 +449,12 @@ export async function insertPurchaseRequest(
   db: D1Database,
   row: Omit<
     PurchaseRequestRow,
-    "created_at" | "outcome_amount_cents" | "outcome_json" | "approver"
+    | "created_at"
+    | "outcome_amount_cents"
+    | "outcome_json"
+    | "approver"
+    | "settlement_rail"
+    | "settlement_ref"
   > & { decision_token?: string | null }
 ): Promise<void> {
   await db
@@ -858,14 +866,204 @@ export async function markOutcomeRecorded(
     requestId: string;
     outcomeAmountCents: number;
     outcomeJson: string | null;
+    settlementRail?: string | null;
+    settlementRef?: string | null;
   }
 ): Promise<void> {
   await db
     .prepare(
       `UPDATE purchase_requests
-       SET status = 'completed', outcome_amount_cents = ?, outcome_json = ?
+       SET status = 'completed', outcome_amount_cents = ?, outcome_json = ?,
+           settlement_rail = ?, settlement_ref = ?
        WHERE org_id = ? AND id = ? AND status = 'approved'`
     )
-    .bind(args.outcomeAmountCents, args.outcomeJson, args.orgId, args.requestId)
+    .bind(
+      args.outcomeAmountCents,
+      args.outcomeJson,
+      args.settlementRail ?? null,
+      args.settlementRef ?? null,
+      args.orgId,
+      args.requestId
+    )
     .run();
+}
+
+// ---------- Settlements (Phase 3: cross-rail charge confirmations) ----------
+
+export type SettlementRow = {
+  id: string;
+  org_id: string;
+  rail: string;
+  settlement_ref: string;
+  vendor: string;
+  amount_cents: number;
+  currency: string;
+  occurred_at: string;
+  raw_json: string;
+  match_status: string;
+  match_method: string;
+  matched_request_id: string | null;
+  variance_cents: number;
+  entered_by: string;
+  created_at: string;
+};
+
+export async function insertSettlement(
+  db: D1Database,
+  row: Omit<SettlementRow, "created_at">
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO settlements
+         (id, org_id, rail, settlement_ref, vendor, amount_cents, currency,
+          occurred_at, raw_json, match_status, match_method, matched_request_id,
+          variance_cents, entered_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      row.id,
+      row.org_id,
+      row.rail,
+      row.settlement_ref,
+      row.vendor,
+      row.amount_cents,
+      row.currency,
+      row.occurred_at,
+      row.raw_json,
+      row.match_status,
+      row.match_method,
+      row.matched_request_id,
+      row.variance_cents,
+      row.entered_by
+    )
+    .run();
+}
+
+export async function getSettlementByRef(
+  db: D1Database,
+  orgId: string,
+  rail: string,
+  settlementRef: string
+): Promise<SettlementRow | null> {
+  return db
+    .prepare(
+      "SELECT * FROM settlements WHERE org_id = ? AND rail = ? AND settlement_ref = ?"
+    )
+    .bind(orgId, rail, settlementRef)
+    .first<SettlementRow>();
+}
+
+export async function listSettlements(
+  db: D1Database,
+  orgId: string,
+  limit = 100
+): Promise<SettlementRow[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT * FROM settlements WHERE org_id = ?
+       ORDER BY created_at DESC, id DESC LIMIT ?`
+    )
+    .bind(orgId, limit)
+    .all<SettlementRow>();
+  return results;
+}
+
+export async function listSettlementsForRequest(
+  db: D1Database,
+  orgId: string,
+  requestId: string
+): Promise<SettlementRow[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT * FROM settlements WHERE org_id = ? AND matched_request_id = ?
+       ORDER BY created_at ASC`
+    )
+    .bind(orgId, requestId)
+    .all<SettlementRow>();
+  return results;
+}
+
+/** Re-point a settlement after a late record_outcome supplies its ref. */
+export async function updateSettlementMatch(
+  db: D1Database,
+  args: {
+    orgId: string;
+    settlementId: string;
+    matchStatus: string;
+    matchMethod: string;
+    matchedRequestId: string | null;
+    varianceCents: number;
+  }
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE settlements
+       SET match_status = ?, match_method = ?, matched_request_id = ?, variance_cents = ?
+       WHERE org_id = ? AND id = ?`
+    )
+    .bind(
+      args.matchStatus,
+      args.matchMethod,
+      args.matchedRequestId,
+      args.varianceCents,
+      args.orgId,
+      args.settlementId
+    )
+    .run();
+}
+
+export async function getRequestBySettlementRef(
+  db: D1Database,
+  orgId: string,
+  settlementRef: string
+): Promise<PurchaseRequestRow | null> {
+  return db
+    .prepare(
+      `SELECT * FROM purchase_requests
+       WHERE org_id = ? AND settlement_ref = ? AND status IN ('approved', 'completed')
+       ORDER BY created_at ASC LIMIT 1`
+    )
+    .bind(orgId, settlementRef)
+    .first<PurchaseRequestRow>();
+}
+
+export async function getRequestByApprovalRef(
+  db: D1Database,
+  orgId: string,
+  approvalRef: string
+): Promise<PurchaseRequestRow | null> {
+  return db
+    .prepare(
+      `SELECT * FROM purchase_requests
+       WHERE org_id = ? AND approval_ref = ? AND status IN ('approved', 'completed')`
+    )
+    .bind(orgId, approvalRef)
+    .first<PurchaseRequestRow>();
+}
+
+/**
+ * Approved/completed purchases from this vendor not yet claimed by any
+ * settlement, oldest first. Amount tolerance and the time window are applied
+ * by the caller (per-row math is clearer in TS than SQL).
+ */
+export async function findHeuristicMatchCandidates(
+  db: D1Database,
+  orgId: string,
+  vendor: string,
+  limit = 50
+): Promise<PurchaseRequestRow[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT pr.* FROM purchase_requests pr
+       WHERE pr.org_id = ? AND LOWER(TRIM(pr.vendor)) = LOWER(TRIM(?))
+         AND pr.status IN ('approved', 'completed')
+         AND NOT EXISTS (
+           SELECT 1 FROM settlements s
+           WHERE s.org_id = pr.org_id AND s.matched_request_id = pr.id
+         )
+       ORDER BY pr.created_at ASC, pr.id ASC LIMIT ?`
+    )
+    .bind(orgId, vendor, limit)
+    .all<PurchaseRequestRow>();
+  return results;
 }
