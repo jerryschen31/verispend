@@ -25,7 +25,10 @@ async function sha256Hex(input: string): Promise<string> {
 
 function b64urlDecode(value: string): Uint8Array {
   const b64 = value.replaceAll("-", "+").replaceAll("_", "/");
-  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  // atob() requires padded base64; base64url signatures are conventionally
+  // unpadded, so restore the "=" padding before decoding.
+  const padded = b64.padEnd(Math.ceil(b64.length / 4) * 4, "=");
+  return Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
 }
 
 export type VerifiableReport = {

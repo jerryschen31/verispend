@@ -1,6 +1,8 @@
 // Kinde OIDC (authorization-code flow, no SDK).
 // https://docs.kinde.com/developer-tools/about/using-kinde-without-an-sdk/
 
+import { b64urlDecode } from "./hash";
+
 export const OAUTH_STATE_COOKIE = "vs_oauth_state";
 export const OAUTH_STATE_TTL_SECONDS = 10 * 60;
 
@@ -52,8 +54,7 @@ export async function exchangeCodeForEmail(
   if (parts.length !== 3) return { error: "malformed id_token" };
   let claims: { iss?: string; aud?: string | string[]; exp?: number; email?: string };
   try {
-    const b64 = parts[1].replaceAll("-", "+").replaceAll("_", "/");
-    claims = JSON.parse(atob(b64));
+    claims = JSON.parse(new TextDecoder().decode(b64urlDecode(parts[1])));
   } catch {
     return { error: "unparseable id_token payload" };
   }

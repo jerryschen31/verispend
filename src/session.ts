@@ -38,7 +38,9 @@ export async function verifyToken(
   token: string,
   purpose: TokenPayload["purpose"]
 ): Promise<TokenPayload | null> {
-  const [bodyB64, sigB64] = token.split(".");
+  const parts = token.split(".");
+  if (parts.length !== 2) return null;
+  const [bodyB64, sigB64] = parts;
   if (!bodyB64 || !sigB64) return null;
   try {
     const body = b64urlDecode(bodyB64);
