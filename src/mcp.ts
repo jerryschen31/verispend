@@ -532,12 +532,16 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
         });
 
         // Late-match pass: the rail's settlement record may have landed before
-        // the agent reported. If an unmatched (or mismatched) settlement with
-        // this exact ref exists, re-point it at this purchase now.
+        // the agent reported. If a still-UNMATCHED settlement with this exact
+        // ref exists, re-point it at this purchase now. Only unmatched
+        // settlements are eligible — otherwise any agent could hijack a
+        // settlement already correctly bound to a different purchase (or
+        // "claim" an unauthorized charge) just by guessing its reference.
+        // Reassigning an already-matched settlement is an admin-only action.
         let rematched: { settlement_id: string; match_status: string } | null = null;
         if (rail && settlement_ref) {
           const settlement = await getSettlementByRef(db, orgId, rail, settlement_ref);
-          if (settlement && settlement.matched_request_id !== request_id) {
+          if (settlement && settlement.matched_request_id === null) {
             const policy = await getActivePolicy(db, orgId);
             const tolerance = resolveReconciliationRules(
               policy?.rules.reconciliation

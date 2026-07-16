@@ -378,6 +378,61 @@ describe("settlement ingestion and cross-rail matching end to end", () => {
     expect(JSON.parse(rematchEvent!.payload_json)).toMatchObject({ rematch: true });
   });
 
+  it("refuses to rematch a settlement already bound to a different purchase", async () => {
+    // Purchase A settles cleanly and claims its settlement (tier-1 match).
+    const purchaseA = await buy("HijackVendor", 18_00);
+    await agent.call("record_outcome", {
+      request_id: purchaseA.request_id,
+      final_amount_cents: 18_00,
+      rail: "card",
+      settlement_ref: "AUTH-HIJACK",
+    });
+    const ingestRes = await (
+      await ingest(orgId, "card", {
+        auth_code: "AUTH-HIJACK",
+        merchant: "HijackVendor",
+        amount_cents: 18_00,
+        currency: "USD",
+        posted_at: new Date().toISOString(),
+      })
+    ).json<IngestResult>();
+    expect(ingestRes.results[0]).toMatchObject({
+      match_status: "matched",
+      matched_request_id: purchaseA.request_id,
+    });
+    const settlementId = ingestRes.results[0].settlement_id;
+
+    // Purchase B reports the SAME settlement_ref — an agent guessing or
+    // reusing another purchase's reference must not be able to steal the
+    // already-correct match.
+    const purchaseB = await buy("HijackVendor", 18_00);
+    const outcome = await agent.call("record_outcome", {
+      request_id: purchaseB.request_id,
+      final_amount_cents: 18_00,
+      rail: "card",
+      settlement_ref: "AUTH-HIJACK",
+    });
+    expect(outcome.settlement_match).toBeUndefined();
+
+    const row = await env.DB.prepare(
+      "SELECT matched_request_id, match_method FROM settlements WHERE org_id = ? AND id = ?"
+    )
+      .bind(orgId, settlementId)
+      .first();
+    expect(row).toMatchObject({
+      matched_request_id: purchaseA.request_id,
+      match_method: "settlement_ref",
+    });
+
+    // No spurious rematch event was appended for purchase B's outcome.
+    const events = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM ledger_events WHERE org_id = ? AND request_id = ?"
+    )
+      .bind(orgId, settlementId)
+      .first<{ n: number }>();
+    expect(events?.n).toBe(2); // settlement_ingested + settlement_matched only
+  });
+
   it("batch-ingests, reporting per-item results including bad records", async () => {
     const res = await SELF.fetch(
       `http://example.com/api/admin/orgs/${orgId}/settlements`,

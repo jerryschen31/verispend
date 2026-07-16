@@ -254,6 +254,25 @@ describe("verifyMandate against the trusted-issuer registry", () => {
     });
   });
 
+  it("trims whitespace-padded claims before storing or reporting them", async () => {
+    const keys = await generateIssuerKeypair("Ed25519");
+    await registerIssuer(orgId, keys, { issuer: `${ISSUER}/trim` });
+    const token = await mintMandate(keys.privateJwk, "Ed25519", {
+      ...ap2Claims({ iss: `${ISSUER}/trim`, sub: "agent-1", vendors: ["Figma"] }),
+      // Padded claims must not leak whitespace into stored/audited values.
+      iss: `  ${ISSUER}/trim  `,
+      sub: "  agent-1  ",
+      jti: "  mnd-padded  ",
+    });
+    const result = await verifyMandate(env.DB, orgId, token, INTENT);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.presentation.issuer).toBe(`${ISSUER}/trim`);
+      expect(result.presentation.subject).toBe("agent-1");
+      expect(result.presentation.mandateRef).toBe("mnd-padded");
+    }
+  });
+
   it("accepts a JWK registered with optional fields (Node-style full export)", async () => {
     // Node's exportKey emits alg "Ed25519" / key_ops / ext, which some
     // runtimes reject at importKey; registration must tolerate a full paste.

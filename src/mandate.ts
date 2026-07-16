@@ -97,7 +97,7 @@ export function parseCompactJws(token: string): ParsedJws | null {
 }
 
 const str = (v: unknown): string | undefined =>
-  typeof v === "string" && v.trim() ? v : undefined;
+  typeof v === "string" && v.trim() ? v.trim() : undefined;
 
 const int = (v: unknown): number | undefined =>
   typeof v === "number" && Number.isInteger(v) ? v : undefined;
