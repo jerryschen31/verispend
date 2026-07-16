@@ -101,6 +101,7 @@ This is not a concept deck. The core spine is built and running in production:
 - **Phase 3 mandate consumption**: agents present network-issued, signed mandate credentials with a purchase; VeriSpend verifies them locally against a per-org registry of trusted issuer public keys (registering a network's published key is the entire integration), enforces the mandate's scope, and can require mandates by policy.
 - **Phase 3 cross-rail settlement matching**: settlement confirmations from any rail are pushed to VeriSpend and matched to the purchase that authorized them — exact reference first, then heuristics — flagging over-charges and charges no agent ever requested.
 - **Phase 3 verifiable receipts**: any decided purchase can be attested with an Ed25519-signed receipt covering intent → authorization → charge → settlement match, anchored into the hash-chained ledger and verifiable offline by a third party with no VeriSpend code.
+- **Phase 4 compliance reports**: an admin can generate a signed, audit-ready report mapping the ledger's evidence to NIST AI RMF, ISO/IEC 42001, and SOX-style control objectives — chain verification, control matrix with citable event anchors, and an exceptions list — printable for an auditor and verifiable offline. Every control-plane change (keys, members, issuer trust roots, teams, exports) is now itself on the tamper-evident chain, and the report presents evidence, never a compliance certification.
 
 Everything below builds on this foundation.
 

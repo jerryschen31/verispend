@@ -22,7 +22,22 @@ export type LedgerEventType =
   | "settlement_ingested"
   | "settlement_matched"
   | "unauthorized_charge"
-  | "receipt_issued";
+  | "receipt_issued"
+  // Control-plane events (Phase 4): identity, trust, and configuration
+  // changes belong on the same tamper-evident chain as the spending they
+  // govern — change-management evidence for auditors.
+  | "org_created"
+  | "agent_key_created"
+  | "agent_key_revoked"
+  | "member_upserted"
+  | "member_removed"
+  | "issuer_registered"
+  | "issuer_revoked"
+  | "team_created"
+  | "team_agent_assigned"
+  | "team_approver_changed"
+  | "export_generated"
+  | "report_generated";
 
 export type LedgerAppend = {
   orgId: string;

@@ -62,7 +62,7 @@ export async function computeKeyId(publicJwk: JsonWebKey): Promise<string> {
   return (await sha256Hex(canonical)).slice(0, 16);
 }
 
-function parseSigningJwk(env: Env): JsonWebKey {
+export function parseSigningJwk(env: Env): JsonWebKey {
   if (!env.RECEIPT_SIGNING_KEY) {
     throw new Error("RECEIPT_SIGNING_KEY secret is not configured");
   }

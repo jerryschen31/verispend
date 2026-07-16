@@ -12,6 +12,7 @@ import {
   getOrg,
   insertMandateIssuer,
   insertPolicy,
+  revokeAgentKey,
   revokeMandateIssuer,
   setAgentTeam,
   setTeamApprover,
@@ -20,14 +21,16 @@ import {
 } from "./db";
 import type { BudgetLimits } from "./policy";
 import {
+  appendExportEvent,
   buildAuditBundle,
   exportPurchasesCsv,
   exportSettlementsCsv,
 } from "./export";
 import { ingestBill } from "./reconcile";
 import { ingestSettlement } from "./settlements";
-import { issueReceipt, listReceiptKeys } from "./receipts";
-import { getLatestReceipt } from "./db";
+import { computeKeyId, issueReceipt, listReceiptKeys } from "./receipts";
+import { buildComplianceReport } from "./report";
+import { getComplianceReport, getLatestReceipt } from "./db";
 import { MANDATE_ALGS, MANDATE_SCHEMES } from "./mandate";
 import { DEFAULT_POLICY, type PolicyRules } from "./policy";
 import { VeriSpendMCP } from "./mcp";
@@ -109,9 +112,28 @@ app.post("/api/admin/orgs", async (c) => {
     orgId,
     rules: body.policy ?? DEFAULT_POLICY,
   });
-  const { apiKey } = await createAgentKey(c.env.DB, {
+  const { apiKey, keyId } = await createAgentKey(c.env.DB, {
     orgId,
     agentId: body.agent_id,
+  });
+
+  // The chain's first event records the org's initial control-plane state:
+  // who was seeded with access, under which policy version.
+  await c.env.ORG.getByName(orgId).appendEvent({
+    orgId,
+    requestId: "org",
+    eventType: "org_created",
+    payload: {
+      name: body.name,
+      createdBy: "admin-api",
+      approverEmail: body.approver_email?.trim().toLowerCase() ?? null,
+      members: (body.members ?? []).flatMap((m) =>
+        m.email && m.role ? [{ email: m.email.trim().toLowerCase(), role: m.role }] : []
+      ),
+      policyVersion: version,
+      agentId: body.agent_id,
+      keyId,
+    },
   });
 
   return c.json({
@@ -134,11 +156,42 @@ app.post("/api/admin/orgs/:orgId/keys", async (c) => {
   }
   const body = await c.req.json<{ agent_id?: string }>();
   if (!body.agent_id) return c.json({ error: "agent_id is required" }, 400);
-  const { apiKey } = await createAgentKey(c.env.DB, {
+  const { apiKey, keyId } = await createAgentKey(c.env.DB, {
     orgId,
     agentId: body.agent_id,
   });
+  await c.env.ORG.getByName(orgId).appendEvent({
+    orgId,
+    requestId: "keys",
+    eventType: "agent_key_created",
+    payload: { keyId, agentId: body.agent_id, createdBy: "admin-api" },
+  });
   return c.json({ agent_id: body.agent_id, api_key: apiKey });
+});
+
+// Credential revocation belongs on the chain: which key lost access, when,
+// and on whose authority. The dashboard's keys page is the session-guarded
+// equivalent.
+app.post("/api/admin/orgs/:orgId/keys/:keyId/revoke", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  if (!(await getOrg(c.env.DB, orgId))) {
+    return c.json({ error: "no such org" }, 404);
+  }
+  const keyId = c.req.param("keyId");
+  const { agentId } = await revokeAgentKey(c.env.DB, orgId, keyId);
+  if (agentId === null) {
+    return c.json({ error: "no such active key" }, 404);
+  }
+  await c.env.ORG.getByName(orgId).appendEvent({
+    orgId,
+    requestId: "keys",
+    eventType: "agent_key_revoked",
+    payload: { keyId, agentId, revokedBy: "admin-api" },
+  });
+  return c.json({ ok: true, agent_id: agentId });
 });
 
 // Member management for API-driven workflows (and the agent simulator). The
@@ -159,6 +212,17 @@ app.post("/api/admin/orgs/:orgId/members", async (c) => {
     orgId,
     email: body.email,
     role: body.role,
+  });
+  await c.env.ORG.getByName(orgId).appendEvent({
+    orgId,
+    requestId: "members",
+    eventType: "member_upserted",
+    payload: {
+      memberId: id,
+      email: body.email.trim().toLowerCase(),
+      role: body.role,
+      changedBy: "admin-api",
+    },
   });
   return c.json({ member_id: id, email: body.email.trim().toLowerCase(), role: body.role });
 });
@@ -182,9 +246,23 @@ app.post("/api/admin/orgs/:orgId/teams", async (c) => {
   if (!body.name?.trim()) return c.json({ error: "name is required" }, 400);
 
   const { teamId } = await createTeam(c.env.DB, { orgId, name: body.name });
+  const coordinator = c.env.ORG.getByName(orgId);
+  await coordinator.appendEvent({
+    orgId,
+    requestId: "teams",
+    eventType: "team_created",
+    payload: { teamId, name: body.name.trim(), createdBy: "admin-api" },
+  });
   for (const agentId of body.agent_ids ?? []) {
     await setAgentTeam(c.env.DB, { orgId, agentId, teamId });
+    await coordinator.appendEvent({
+      orgId,
+      requestId: "teams",
+      eventType: "team_agent_assigned",
+      payload: { teamId, agentId, action: "add", changedBy: "admin-api" },
+    });
   }
+  const approverEmails: string[] = [];
   for (const email of body.approver_emails ?? []) {
     const member = await getMembership(c.env.DB, orgId, email);
     if (!member || member.role === "viewer") {
@@ -194,6 +272,15 @@ app.post("/api/admin/orgs/:orgId/teams", async (c) => {
       );
     }
     await setTeamApprover(c.env.DB, { teamId, memberId: member.id, on: true });
+    approverEmails.push(member.email);
+  }
+  if (approverEmails.length > 0) {
+    await coordinator.appendEvent({
+      orgId,
+      requestId: "teams",
+      eventType: "team_approver_changed",
+      payload: { teamId, approvers: approverEmails, changedBy: "admin-api" },
+    });
   }
 
   let policyVersion: number | null = null;
@@ -256,6 +343,19 @@ app.post("/api/admin/orgs/:orgId/issuers", async (c) => {
     alg: body.alg,
     publicKeyJwk: JSON.stringify(body.public_key_jwk),
   });
+  await c.env.ORG.getByName(orgId).appendEvent({
+    orgId,
+    requestId: "issuers",
+    eventType: "issuer_registered",
+    payload: {
+      issuerId,
+      issuer: body.issuer.trim(),
+      scheme: body.scheme,
+      alg: body.alg,
+      keyThumbprint: await computeKeyId(body.public_key_jwk as unknown as JsonWebKey),
+      registeredBy: "admin-api",
+    },
+  });
   return c.json({ issuer_id: issuerId });
 });
 
@@ -267,7 +367,16 @@ app.post("/api/admin/orgs/:orgId/issuers/:issuerId/revoke", async (c) => {
   if (!(await getOrg(c.env.DB, orgId))) {
     return c.json({ error: "no such org" }, 404);
   }
-  await revokeMandateIssuer(c.env.DB, orgId, c.req.param("issuerId"));
+  const issuerId = c.req.param("issuerId");
+  const { issuer } = await revokeMandateIssuer(c.env.DB, orgId, issuerId);
+  if (issuer !== null) {
+    await c.env.ORG.getByName(orgId).appendEvent({
+      orgId,
+      requestId: "issuers",
+      eventType: "issuer_revoked",
+      payload: { issuerId, issuer, revokedBy: "admin-api" },
+    });
+  }
   return c.json({ ok: true });
 });
 
@@ -384,6 +493,45 @@ app.get("/api/admin/orgs/:orgId/requests/:requestId/receipt.json", async (c) => 
   return c.body(row.receipt_json, 200, { "content-type": "application/json" });
 });
 
+// Compliance reports (Phase 4): generate a signed, audit-ready report
+// mapping the org's ledger evidence to framework controls, or fetch a
+// stored one. The dashboard's Reports page is the session-guarded
+// equivalent; this admin twin is what makes the demo reproducible on dev
+// and production alike.
+app.post("/api/admin/orgs/:orgId/reports", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  if (!(await getOrg(c.env.DB, orgId))) {
+    return c.json({ error: "no such org" }, 404);
+  }
+  const body = await c.req
+    .json<{ period_start?: string; period_end?: string }>()
+    .catch(() => ({}) as { period_start?: string; period_end?: string });
+  const result = await buildComplianceReport(c.env, {
+    orgId,
+    period: { start: body.period_start, end: body.period_end },
+    issuedBy: "admin-api",
+  });
+  if (!result.ok) return c.json({ error: result.error }, 400);
+  return c.json(result.report);
+});
+
+app.get("/api/admin/orgs/:orgId/reports/:reportId", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  const row = await getComplianceReport(
+    c.env.DB,
+    orgId,
+    c.req.param("reportId")
+  );
+  if (!row) return c.json({ error: "no such report" }, 404);
+  return c.body(row.report_json, 200, { "content-type": "application/json" });
+});
+
 // Admin-key twins of the dashboard exports, for the simulator and CI (no
 // session machinery in Node). Same query params as the dashboard routes.
 app.get("/api/admin/orgs/:orgId/export/purchases.csv", async (c) => {
@@ -394,6 +542,7 @@ app.get("/api/admin/orgs/:orgId/export/purchases.csv", async (c) => {
   if (!(await getOrg(c.env.DB, orgId))) {
     return c.json({ error: "no such org" }, 404);
   }
+  await appendExportEvent(c.env, orgId, "purchases.csv", "admin-api");
   const csv = await exportPurchasesCsv(c.env.DB, orgId, {
     from: c.req.query("from") || undefined,
     to: c.req.query("to") || undefined,
@@ -412,6 +561,7 @@ app.get("/api/admin/orgs/:orgId/export/settlements.csv", async (c) => {
   if (!(await getOrg(c.env.DB, orgId))) {
     return c.json({ error: "no such org" }, 404);
   }
+  await appendExportEvent(c.env, orgId, "settlements.csv", "admin-api");
   const csv = await exportSettlementsCsv(c.env.DB, orgId, {
     from: c.req.query("from") || undefined,
     to: c.req.query("to") || undefined,
@@ -429,6 +579,7 @@ app.get("/api/admin/orgs/:orgId/export/audit-bundle.json", async (c) => {
   if (!(await getOrg(c.env.DB, orgId))) {
     return c.json({ error: "no such org" }, 404);
   }
+  await appendExportEvent(c.env, orgId, "audit-bundle.json", "admin-api");
   return c.json(await buildAuditBundle(c.env.DB, orgId));
 });
 

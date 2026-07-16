@@ -21,6 +21,11 @@ Phase 3 adds the cross-rail plane — all of it consume-only, with zero calls to
 - **Cross-rail settlements** — rails and finance systems push settlement confirmations (card record, stablecoin tx, checkout receipt, Stripe-event JSON) to the Settlements page or `POST /api/admin/orgs/:id/settlements`. Each is matched to its purchase in three tiers: the `settlement_ref` the agent reported at `record_outcome`, our `approval_ref` echoed back by the rail, then a vendor/amount/time heuristic. Over-charges flag `amount_mismatch`; a charge no agent ever requested flags `unauthorized` and alerts approvers.
 - **Verifiable receipts** — any decided purchase (denials too) can be attested with an Ed25519-signed receipt covering the request, decision, mandate, outcome, and settlement match, with ledger-hash anchors tying it into the tamper-evident chain. Verify offline with `node scripts/verify-receipt.ts receipt.json [bundle.json]` — no VeriSpend code, no network. Signing keys are published at `/.well-known/verispend-keys.json`. See `docs/receipt-verification.md`.
 
+Phase 4 turns the audit trail into audit **reports**:
+
+- **Compliance reports** — an org admin (dashboard → Reports) or the admin API (`POST /api/admin/orgs/:id/reports`) generates a signed, audit-ready report mapping the ledger's evidence to NIST AI RMF, ISO/IEC 42001 Annex A, and SOX-style control objectives: chain verification, activity summary, a control matrix with citable event anchors, and an exceptions list (unauthorized charges, over-billing, settlement mismatches, frozen agents, policy changes). The report is evidence for an auditor, not a certification. Printable HTML view (print → PDF); verify the signed JSON offline with `node scripts/verify-report.ts report.json [bundle.json]`. See `docs/compliance-reports.md`.
+- **Control-plane audit events** — key create/revoke, member and role changes, issuer trust-root registration/revocation, team and approver-routing changes, org creation, and every export/report generation now land on the hash-chained ledger, closing the change-management gap auditors test first. The audit bundle (v2) embeds the control-plane reference state (members, key lifecycle, issuers, teams — never credential hashes).
+
 ## MCP tools
 
 | Tool | Purpose |
@@ -50,17 +55,20 @@ npm run simulate     # 4-agent demo/E2E against the dev server (see below)
 ### Agent simulator
 
 With `npm run dev` running, `npm run simulate` provisions a fresh demo org and
-drives eleven scenarios through the real MCP endpoint: a well-behaved buyer, a
+drives twelve scenarios through the real MCP endpoint: a well-behaved buyer, a
 runaway loop that trips the circuit breaker, a metered agent whose provider
 over-bills it, a prompt-injected agent contained by the deny-list and the
 velocity breaker, team budget races, approval routing, explainability, audit
 export, a mandated agent presenting (and forging) signed credentials, a
 cross-rail settlement feed with an over-charge and an unauthorized charge,
-and a verifiable receipt re-verified with zero VeriSpend code. It prints a
-narrated report and exits non-zero if any expectation fails. Pass
-`--approver you@example.com` to make the demo org's dashboard accessible to
-your login. Everything runs locally — the "payment network" is a keypair the
-simulator generates in-process.
+a verifiable receipt re-verified with zero VeriSpend code, and a signed
+compliance report whose control mappings, exceptions, and ledger anchors are
+re-verified offline. It prints a narrated report and exits non-zero if any
+expectation fails. Pass `--approver you@example.com` to make the demo org's
+dashboard accessible to your login. Everything runs locally — the "payment
+network" is a keypair the simulator generates in-process. Point `--base-url`
+and `--admin-key` at production to seed the same demo there (see
+`docs/compliance-reports.md` for the demo runbook).
 
 Provision a local org (admin key is in `.dev.vars`):
 

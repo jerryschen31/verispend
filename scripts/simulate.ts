@@ -18,6 +18,11 @@ import {
   type VerifiableReceipt,
 } from "./verify-receipt.ts";
 import { ap2Claims, generateIssuerKeypair, mintMandate } from "./test-issuer.ts";
+import {
+  crossCheckReportAnchor,
+  verifyReport,
+  type VerifiableReport,
+} from "./verify-report.ts";
 
 declare const process: {
   argv: string[];
@@ -719,6 +724,105 @@ async function main() {
     );
   }
 
+  // ── Scenario 12: the compliance report an auditor can take away ─────
+  section("Scenario 12 — compliance report: audit-ready, signed, framework-mapped");
+  {
+    const report = (await adminPost(
+      `/api/admin/orgs/${orgId}/reports`,
+      {}
+    )) as VerifiableReport;
+    check(
+      report.format === "verispend-compliance-report",
+      "the admin API generates a signed compliance report"
+    );
+
+    const verdict = await verifyReport(report);
+    check(
+      verdict.ok,
+      "the report's Ed25519 signature verifies offline (zero VeriSpend code)",
+      verdict.reason
+    );
+
+    const payload = JSON.parse(report.payload_json);
+    check(
+      payload.chain_verification.ok === true,
+      "the report embeds a full hash-chain verification of the ledger"
+    );
+    check(
+      ["nist-ai-rmf", "iso-42001", "sox-itgc"].every((id) =>
+        payload.frameworks.some(
+          (f: any) => f.id === id && f.controls.length >= 7
+        )
+      ),
+      "controls are mapped across NIST AI RMF, ISO/IEC 42001, and SOX-style objectives"
+    );
+    const iso628 = payload.frameworks
+      .find((f: any) => f.id === "iso-42001")
+      .controls.find((c: any) => c.control_id === "A.6.2.8");
+    check(
+      iso628?.status === "evidenced",
+      "ISO 42001 A.6.2.8 (event logging) is evidenced by the verified chain"
+    );
+
+    check(
+      payload.exceptions.unauthorized_charges.some(
+        (s: any) => s.vendor === "Phantom Vendor Ltd"
+      ),
+      "scenario 10's unauthorized charge surfaces in the exceptions for the auditor"
+    );
+    check(
+      payload.exceptions.overbilled_bills.some(
+        (b: any) => b.vendor === "InferenceCloud"
+      ),
+      "scenario 3's over-billed invoice surfaces in the exceptions"
+    );
+    check(
+      payload.exceptions.frozen_agents.length >= 2,
+      "the frozen loop-agent and injected-agent appear as open incidents"
+    );
+    check(
+      payload.activity.receipts_issued >= 1 &&
+        payload.activity.mandates.verified >= 1,
+      "the report counts scenario 9/11's verified mandate and signed receipt"
+    );
+
+    const bundle = JSON.parse(
+      await adminGetText(`/api/admin/orgs/${orgId}/export/audit-bundle.json`)
+    ) as VerifiableBundle;
+    const anchors = crossCheckReportAnchor(report, bundle);
+    check(
+      anchors.ok,
+      `the report's ${anchors.checked} ledger anchors appear in the verified audit bundle`,
+      anchors.reason
+    );
+    check(
+      bundle.events.some((e) => e.event_type === "report_generated"),
+      "generating the report is itself an event on the tamper-evident chain"
+    );
+
+    const tampered: VerifiableReport = {
+      ...report,
+      payload_json: report.payload_json.replace(
+        "Phantom Vendor Ltd",
+        "Innocent Vendor Co"
+      ),
+    };
+    const caught = await verifyReport(tampered);
+    check(
+      !caught.ok,
+      "whitewashing an exception inside the report breaks the signature",
+      caught.ok ? "tampering went undetected!" : undefined
+    );
+
+    const stored = JSON.parse(
+      await adminGetText(`/api/admin/orgs/${orgId}/reports/${report.report_id}`)
+    ) as VerifiableReport;
+    check(
+      stored.signature.sig === report.signature.sig,
+      "the stored report re-serves verbatim for later audits"
+    );
+  }
+
   // ── Wrap up ─────────────────────────────────────────────────────────
   section("Result");
   console.log(`  ${passed} checks passed, ${failed} failed`);
@@ -727,7 +831,9 @@ async function main() {
       `\noverbilled InferenceCloud invoice, a research team that exhausted its shared` +
       `\nbudget, three pending approvals (one routed to lead@sim.test), a mandated` +
       `\npurchase with a signed verifiable receipt, a cross-rail settlement feed with` +
-      `\nan over-charge and an unauthorized charge, and a verified audit bundle.` +
+      `\nan over-charge and an unauthorized charge, a verified audit bundle, and a` +
+      `\nsigned compliance report mapped to NIST AI RMF, ISO 42001, and SOX-style` +
+      `\ncontrols (dashboard → Reports).` +
       (APPROVER
         ? `\nLog in at ${BASE_URL}/dashboard as ${APPROVER} to review it.`
         : `\nRe-run with --approver you@example.com to inspect it in the dashboard.`)

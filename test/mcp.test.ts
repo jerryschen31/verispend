@@ -194,7 +194,7 @@ describe("MCP purchase flow", () => {
   it("keeps a verifiable ledger across the whole session", async () => {
     const verification = await verifyLedgerChain(env.DB, orgId);
     expect(verification.ok).toBe(true);
-    // 6 requests × 2 events + 1 outcome event + 1 approval_routed event
-    expect(verification).toMatchObject({ count: 14 });
+    // org_created + 6 requests × 2 events + 1 outcome event + 1 approval_routed event
+    expect(verification).toMatchObject({ count: 15 });
   });
 });

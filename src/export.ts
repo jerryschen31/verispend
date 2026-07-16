@@ -3,10 +3,41 @@
 // recipe to re-verify it independently of this codebase.
 
 import { verifyLedgerChain, type ChainVerification } from "./ledger";
-import { getOrg } from "./db";
+import {
+  getOrg,
+  listAgentKeys,
+  listMandateIssuers,
+  listMembers,
+  listTeamAgents,
+  listTeamApprovers,
+  listTeams,
+} from "./db";
 
 /** All exports cap at this many rows; noted in the dashboard UI. */
 export const EXPORT_ROW_LIMIT = 10_000;
+
+/** Exports are data egress; each download is itself recorded on the chain. */
+export async function appendExportEvent(
+  env: Env,
+  orgId: string,
+  exportType: string,
+  by: string,
+  filters?: Record<string, string | undefined>
+): Promise<void> {
+  const applied = Object.fromEntries(
+    Object.entries(filters ?? {}).filter(([, v]) => v !== undefined && v !== "")
+  );
+  await env.ORG.getByName(orgId).appendEvent({
+    orgId,
+    requestId: "export",
+    eventType: "export_generated",
+    payload: {
+      exportType,
+      by,
+      ...(Object.keys(applied).length > 0 ? { filters: applied } : {}),
+    },
+  });
+}
 
 const esc = (v: unknown) => `"${String(v ?? "").replaceAll('"', '""')}"`;
 
@@ -164,11 +195,40 @@ export async function exportSettlementsCsv(
 
 export type AuditBundle = {
   format: "verispend-audit-bundle";
-  version: 1;
+  version: 2;
   generated_at: string;
   org: { id: string; name: string };
   /** Every policy version, rules verbatim, so decisions can be re-read. */
   policies: Array<{ version: number; rules_json: string; created_at: string }>;
+  /**
+   * Control-plane state at export time (v2): who holds access and which
+   * trust roots are registered — the reference data an auditor reads the
+   * chain's control-plane events against. Never includes key hashes or
+   * other secret material.
+   */
+  control_plane: {
+    members: Array<{ id: string; email: string; role: string; created_at: string }>;
+    agent_keys: Array<{
+      id: string;
+      agent_id: string;
+      created_at: string;
+      revoked_at: string | null;
+    }>;
+    issuers: Array<{
+      id: string;
+      issuer: string;
+      scheme: string;
+      alg: string;
+      created_at: string;
+      revoked_at: string | null;
+    }>;
+    teams: Array<{
+      id: string;
+      name: string;
+      agents: string[];
+      approvers: string[];
+    }>;
+  };
   verification: ChainVerification & { verified_at: string };
   hash_recipe: {
     algorithm: "SHA-256";
@@ -215,12 +275,45 @@ export async function buildAuditBundle(
     .bind(orgId)
     .all<AuditBundle["policies"][number]>();
 
+  const teams = await listTeams(db, orgId);
+  const controlPlane: AuditBundle["control_plane"] = {
+    members: (await listMembers(db, orgId)).map((m) => ({
+      id: m.id,
+      email: m.email,
+      role: m.role,
+      created_at: m.created_at,
+    })),
+    agent_keys: (await listAgentKeys(db, orgId)).map((k) => ({
+      id: k.id,
+      agent_id: k.agent_id,
+      created_at: k.created_at,
+      revoked_at: k.revoked_at,
+    })),
+    issuers: (await listMandateIssuers(db, orgId)).map((i) => ({
+      id: i.id,
+      issuer: i.issuer,
+      scheme: i.scheme,
+      alg: i.alg,
+      created_at: i.created_at,
+      revoked_at: i.revoked_at,
+    })),
+    teams: await Promise.all(
+      teams.map(async (t) => ({
+        id: t.id,
+        name: t.name,
+        agents: await listTeamAgents(db, t.id),
+        approvers: (await listTeamApprovers(db, t.id)).map((a) => a.email),
+      }))
+    ),
+  };
+
   return {
     format: "verispend-audit-bundle",
-    version: 1,
+    version: 2,
     generated_at: new Date().toISOString(),
     org: { id: orgId, name: org?.name ?? "" },
     policies,
+    control_plane: controlPlane,
     verification: { ...verification, verified_at: new Date().toISOString() },
     hash_recipe: {
       algorithm: "SHA-256",

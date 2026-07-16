@@ -11,9 +11,11 @@ import {
   getFirstMembershipByEmail,
   getMemberById,
   getLatestReceipt,
+  getComplianceReport,
   getMandateForRequest,
   getMembership,
   getOrg,
+  listComplianceReports,
   getOrgByApproverEmail,
   insertMandateIssuer,
   insertPolicy,
@@ -45,11 +47,18 @@ import {
 import { resolveTeamLimits } from "./policy";
 import { ingestBill } from "./reconcile";
 import { ingestSettlement, SETTLEMENT_RAILS } from "./settlements";
-import { issueReceipt } from "./receipts";
+import { computeKeyId, issueReceipt } from "./receipts";
+import {
+  buildComplianceReport,
+  type ReportDocument,
+  type ReportPayload,
+  type EvidenceStatus,
+} from "./report";
 import { MANDATE_ALGS, MANDATE_SCHEMES } from "./mandate";
 import { verifyLedgerChain } from "./ledger";
 import {
   EXPORT_ROW_LIMIT,
+  appendExportEvent,
   buildAuditBundle,
   exportBillsCsv,
   exportLedgerEventsCsv,
@@ -112,6 +121,13 @@ const Layout = (props: { title: string; orgName?: string; children: Child }) => 
         input, textarea, select { font: inherit; padding: 0.4rem; border: 1px solid #d1d5db; border-radius: 6px; }
         textarea { width: 100%; font-family: ui-monospace, monospace; }
         code { background: #f1f5f9; padding: 0.1rem 0.3rem; border-radius: 4px; }
+        @media print {
+          header, .no-print { display: none; }
+          main { max-width: none; margin: 0; padding: 0; }
+          h2 { page-break-after: avoid; }
+          table { page-break-inside: auto; }
+          tr { page-break-inside: avoid; }
+        }
       `}</style>
     </head>
     <body>
@@ -127,6 +143,7 @@ const Layout = (props: { title: string; orgName?: string; children: Child }) => 
         <a href="/dashboard/teams">Teams</a>
         <a href="/dashboard/members">Members</a>
         <a href="/dashboard/export">Export</a>
+        <a href="/dashboard/reports">Reports</a>
         <a href="/dashboard/audit">Audit</a>
         <span style="flex:1" />
         {props.orgName && <span class="muted">{props.orgName}</span>}
@@ -358,6 +375,7 @@ const decidePosts: MiddlewareHandler<{ Bindings: Env; Variables: Vars }> = (
   next
 ) => (c.req.method === "POST" ? canDecide(c, next) : next());
 dashboard.use("/dashboard/settlements", decidePosts);
+dashboard.use("/dashboard/reports", adminPosts);
 dashboard.use("/dashboard/issuers", adminPosts);
 dashboard.use("/dashboard/issuers/revoke", adminOnly);
 dashboard.use("/dashboard/requests/:id/receipt", canDecide);
@@ -543,32 +561,46 @@ dashboard.get("/dashboard/export", async (c) => {
   );
 });
 
+// The export_generated event lands BEFORE the export is built, so every
+// export includes the record of its own generation and matches the chain
+// state at the moment it was produced.
 dashboard.get("/dashboard/export/purchases.csv", async (c) => {
-  const csv = await exportPurchasesCsv(c.env.DB, c.get("orgId"), exportFilters(c));
+  const filters = exportFilters(c);
+  await appendExportEvent(c.env, c.get("orgId"), "purchases.csv", c.get("email"), filters);
+  const csv = await exportPurchasesCsv(c.env.DB, c.get("orgId"), filters);
   return c.body(csv, 200, csvHeaders("verispend-purchases.csv"));
 });
 
 dashboard.get("/dashboard/export/ledger-events.csv", async (c) => {
-  const csv = await exportLedgerEventsCsv(c.env.DB, c.get("orgId"), exportFilters(c));
+  const filters = exportFilters(c);
+  await appendExportEvent(c.env, c.get("orgId"), "ledger-events.csv", c.get("email"), filters);
+  const csv = await exportLedgerEventsCsv(c.env.DB, c.get("orgId"), filters);
   return c.body(csv, 200, csvHeaders("verispend-ledger-events.csv"));
 });
 
 dashboard.get("/dashboard/export/usage.csv", async (c) => {
-  const csv = await exportUsageCsv(c.env.DB, c.get("orgId"), exportFilters(c));
+  const filters = exportFilters(c);
+  await appendExportEvent(c.env, c.get("orgId"), "usage.csv", c.get("email"), filters);
+  const csv = await exportUsageCsv(c.env.DB, c.get("orgId"), filters);
   return c.body(csv, 200, csvHeaders("verispend-usage.csv"));
 });
 
 dashboard.get("/dashboard/export/bills.csv", async (c) => {
-  const csv = await exportBillsCsv(c.env.DB, c.get("orgId"), exportFilters(c));
+  const filters = exportFilters(c);
+  await appendExportEvent(c.env, c.get("orgId"), "bills.csv", c.get("email"), filters);
+  const csv = await exportBillsCsv(c.env.DB, c.get("orgId"), filters);
   return c.body(csv, 200, csvHeaders("verispend-bills.csv"));
 });
 
 dashboard.get("/dashboard/export/settlements.csv", async (c) => {
-  const csv = await exportSettlementsCsv(c.env.DB, c.get("orgId"), exportFilters(c));
+  const filters = exportFilters(c);
+  await appendExportEvent(c.env, c.get("orgId"), "settlements.csv", c.get("email"), filters);
+  const csv = await exportSettlementsCsv(c.env.DB, c.get("orgId"), filters);
   return c.body(csv, 200, csvHeaders("verispend-settlements.csv"));
 });
 
 dashboard.get("/dashboard/export/audit-bundle.json", async (c) => {
+  await appendExportEvent(c.env, c.get("orgId"), "audit-bundle.json", c.get("email"));
   const bundle = await buildAuditBundle(c.env.DB, c.get("orgId"));
   return c.body(JSON.stringify(bundle, null, 2), 200, {
     "content-type": "application/json",
@@ -927,23 +959,43 @@ dashboard.post("/dashboard/issuers", async (c) => {
   if (typeof jwk !== "object" || jwk === null) {
     return fail("public key must be a JWK object");
   }
-  await insertMandateIssuer(c.env.DB, {
-    orgId: c.get("orgId"),
+  const orgId = c.get("orgId");
+  const { issuerId } = await insertMandateIssuer(c.env.DB, {
+    orgId,
     issuer,
     scheme,
     alg,
     publicKeyJwk: JSON.stringify(jwk),
+  });
+  await c.env.ORG.getByName(orgId).appendEvent({
+    orgId,
+    requestId: "issuers",
+    eventType: "issuer_registered",
+    payload: {
+      issuerId,
+      issuer,
+      scheme,
+      alg,
+      keyThumbprint: await computeKeyId(jwk as JsonWebKey),
+      registeredBy: c.get("email"),
+    },
   });
   return c.redirect("/dashboard/issuers");
 });
 
 dashboard.post("/dashboard/issuers/revoke", async (c) => {
   const form = await c.req.formData();
-  await revokeMandateIssuer(
-    c.env.DB,
-    c.get("orgId"),
-    String(form.get("issuer_id") ?? "")
-  );
+  const orgId = c.get("orgId");
+  const issuerId = String(form.get("issuer_id") ?? "");
+  const { issuer } = await revokeMandateIssuer(c.env.DB, orgId, issuerId);
+  if (issuer !== null) {
+    await c.env.ORG.getByName(orgId).appendEvent({
+      orgId,
+      requestId: "issuers",
+      eventType: "issuer_revoked",
+      payload: { issuerId, issuer, revokedBy: c.get("email") },
+    });
+  }
   return c.redirect("/dashboard/issuers");
 });
 
@@ -1078,9 +1130,16 @@ dashboard.post("/dashboard/keys/create", async (c) => {
   const form = await c.req.formData();
   const agentId = String(form.get("agent_id") ?? "").trim();
   if (!agentId) return c.text("agent_id is required", 400);
-  const { apiKey } = await createAgentKey(c.env.DB, {
-    orgId: c.get("orgId"),
+  const orgId = c.get("orgId");
+  const { apiKey, keyId } = await createAgentKey(c.env.DB, {
+    orgId,
     agentId,
+  });
+  await c.env.ORG.getByName(orgId).appendEvent({
+    orgId,
+    requestId: "keys",
+    eventType: "agent_key_created",
+    payload: { keyId, agentId, createdBy: c.get("email") },
   });
   const org = await getOrg(c.env.DB, c.get("orgId"));
   return c.html(
@@ -1122,7 +1181,17 @@ dashboard.post("/dashboard/agents/unfreeze", async (c) => {
 
 dashboard.post("/dashboard/keys/revoke", async (c) => {
   const form = await c.req.formData();
-  await revokeAgentKey(c.env.DB, c.get("orgId"), String(form.get("key_id") ?? ""));
+  const orgId = c.get("orgId");
+  const keyId = String(form.get("key_id") ?? "");
+  const { agentId } = await revokeAgentKey(c.env.DB, orgId, keyId);
+  if (agentId !== null) {
+    await c.env.ORG.getByName(orgId).appendEvent({
+      orgId,
+      requestId: "keys",
+      eventType: "agent_key_revoked",
+      payload: { keyId, agentId, revokedBy: c.get("email") },
+    });
+  }
   return c.redirect("/dashboard/keys");
 });
 
@@ -1383,7 +1452,14 @@ dashboard.post("/dashboard/teams", async (c) => {
   const form = await c.req.formData();
   const name = String(form.get("name") ?? "").trim();
   if (!name) return c.text("name is required", 400);
-  const { teamId } = await createTeam(c.env.DB, { orgId: c.get("orgId"), name });
+  const orgId = c.get("orgId");
+  const { teamId } = await createTeam(c.env.DB, { orgId, name });
+  await c.env.ORG.getByName(orgId).appendEvent({
+    orgId,
+    requestId: "teams",
+    eventType: "team_created",
+    payload: { teamId, name, createdBy: c.get("email") },
+  });
   return c.redirect(`/dashboard/teams/${teamId}`);
 });
 
@@ -1516,10 +1592,17 @@ dashboard.post("/dashboard/teams/:teamId/agents", async (c) => {
   const form = await c.req.formData();
   const agentId = String(form.get("agent_id") ?? "").trim();
   if (!agentId) return c.text("agent_id is required", 400);
+  const action = form.get("action") === "remove" ? "remove" : "add";
   await setAgentTeam(c.env.DB, {
     orgId,
     agentId,
-    teamId: form.get("action") === "remove" ? null : team.id,
+    teamId: action === "remove" ? null : team.id,
+  });
+  await c.env.ORG.getByName(orgId).appendEvent({
+    orgId,
+    requestId: "teams",
+    eventType: "team_agent_assigned",
+    payload: { teamId: team.id, agentId, action, changedBy: c.get("email") },
   });
   return c.redirect(`/dashboard/teams/${team.id}`);
 });
@@ -1541,6 +1624,16 @@ dashboard.post("/dashboard/teams/:teamId/approvers", async (c) => {
       on: selected.has(member.id),
     });
   }
+  await c.env.ORG.getByName(orgId).appendEvent({
+    orgId,
+    requestId: "teams",
+    eventType: "team_approver_changed",
+    payload: {
+      teamId: team.id,
+      approvers: eligible.filter((m) => selected.has(m.id)).map((m) => m.email),
+      changedBy: c.get("email"),
+    },
+  });
   return c.redirect(`/dashboard/teams/${team.id}`);
 });
 
@@ -1666,7 +1759,18 @@ dashboard.post("/dashboard/members", async (c) => {
       return c.text("Cannot demote the last admin.", 400);
     }
   }
-  await upsertMember(c.env.DB, { orgId, email, role });
+  const { id } = await upsertMember(c.env.DB, { orgId, email, role });
+  await c.env.ORG.getByName(orgId).appendEvent({
+    orgId,
+    requestId: "members",
+    eventType: "member_upserted",
+    payload: {
+      memberId: id,
+      email: email.toLowerCase(),
+      role,
+      changedBy: c.get("email"),
+    },
+  });
   return c.redirect("/dashboard/members");
 });
 
@@ -1680,7 +1784,330 @@ dashboard.post("/dashboard/members/delete", async (c) => {
     return c.text("Cannot remove the last admin.", 400);
   }
   await deleteMember(c.env.DB, orgId, memberId);
+  await c.env.ORG.getByName(orgId).appendEvent({
+    orgId,
+    requestId: "members",
+    eventType: "member_removed",
+    payload: {
+      memberId,
+      email: member.email,
+      role: member.role,
+      removedBy: c.get("email"),
+    },
+  });
   return c.redirect("/dashboard/members");
+});
+
+// ---------- Compliance reports (Phase 4) ----------
+
+const EVIDENCE_COLORS: Record<EvidenceStatus, string> = {
+  evidenced: "#16a34a",
+  attention: "#dc2626",
+  no_activity: "#6b7280",
+};
+
+const EvidencePill = ({ status }: { status: EvidenceStatus }) => (
+  <span class="pill" style={`background:${EVIDENCE_COLORS[status]}`}>
+    {status.replaceAll("_", " ")}
+  </span>
+);
+
+dashboard.get("/dashboard/reports", async (c) => {
+  const orgId = c.get("orgId");
+  const org = await getOrg(c.env.DB, orgId);
+  const reports = await listComplianceReports(c.env.DB, orgId);
+  const isAdmin = c.get("role") === "admin";
+  const error = c.req.query("error");
+  return c.html(
+    <Layout title="Reports" orgName={org?.name}>
+      <h2>Compliance reports</h2>
+      <p class="muted">
+        A report is a signed, audit-ready attestation mapping this org's
+        ledger evidence to framework controls (NIST AI RMF, ISO/IEC 42001,
+        SOX-style objectives). It presents evidence for an auditor — it is
+        not a certification. Verify any report offline with{" "}
+        <code>node scripts/verify-report.ts report.json</code>.
+      </p>
+      {error && <p style="color:#dc2626">{error}</p>}
+      {isAdmin && (
+        <form method="post" action="/dashboard/reports" style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1.2rem">
+          <label>From <input name="period_start" type="date" /></label>
+          <label>To <input name="period_end" type="date" /></label>
+          <button class="btn" style="background:#0f172a">Generate report</button>
+          <span class="muted" style="align-self:center">
+            Leave dates blank to cover the full history.
+          </span>
+        </form>
+      )}
+      {reports.length === 0 ? (
+        <p class="muted">No reports generated yet.</p>
+      ) : (
+        <table>
+          <tr>
+            <th>Generated (UTC)</th>
+            <th>Period</th>
+            <th>Issued by</th>
+            <th>Signing key</th>
+            <th />
+          </tr>
+          {reports.map((r) => (
+            <tr>
+              <td>
+                <a href={`/dashboard/reports/${r.id}`}>
+                  {r.created_at.slice(0, 16).replace("T", " ")}
+                </a>
+              </td>
+              <td>
+                {r.period_start ?? "genesis"} → {r.period_end ?? "now"}
+              </td>
+              <td>{r.issued_by}</td>
+              <td>
+                <code>{r.key_id}</code>
+              </td>
+              <td>
+                <a href={`/dashboard/reports/${r.id}/report.json`}>report.json</a>
+              </td>
+            </tr>
+          ))}
+        </table>
+      )}
+    </Layout>
+  );
+});
+
+dashboard.post("/dashboard/reports", async (c) => {
+  const form = await c.req.formData();
+  const period = {
+    start: String(form.get("period_start") ?? "").trim() || undefined,
+    end: String(form.get("period_end") ?? "").trim() || undefined,
+  };
+  const result = await buildComplianceReport(c.env, {
+    orgId: c.get("orgId"),
+    period,
+    issuedBy: c.get("email"),
+  });
+  if (!result.ok) {
+    return c.redirect(`/dashboard/reports?error=${encodeURIComponent(result.error)}`);
+  }
+  return c.redirect(`/dashboard/reports/${result.report.report_id}`);
+});
+
+dashboard.get("/dashboard/reports/:id", async (c) => {
+  const orgId = c.get("orgId");
+  const row = await getComplianceReport(c.env.DB, orgId, c.req.param("id"));
+  if (!row) return c.text("No such report", 404);
+  const org = await getOrg(c.env.DB, orgId);
+  const doc = JSON.parse(row.report_json) as ReportDocument;
+  const payload = JSON.parse(doc.payload_json) as ReportPayload;
+  const chain = payload.chain_verification;
+  const counts = (record: Record<string, number>) =>
+    Object.entries(record)
+      .map(([k, n]) => `${k.replaceAll("_", " ")}: ${n}`)
+      .join(", ") || "none";
+  const exceptionCount =
+    payload.exceptions.unauthorized_charges.length +
+    payload.exceptions.overbilled_bills.length +
+    payload.exceptions.settlement_amount_mismatches.length +
+    payload.exceptions.frozen_agents.length;
+  return c.html(
+    <Layout title="Compliance report" orgName={org?.name}>
+      <div class="no-print" style="display:flex;gap:0.8rem;align-items:center;margin-bottom:1rem">
+        <a href="/dashboard/reports">← Reports</a>
+        <span style="flex:1" />
+        <a href={`/dashboard/reports/${row.id}/report.json`}>Download report.json</a>
+        <button class="btn" style="background:#0f172a" onclick="window.print()">
+          Print / save as PDF
+        </button>
+      </div>
+
+      <h1 style="margin-bottom:0.2rem">Agent spend compliance report</h1>
+      <p class="muted" style="margin-top:0">
+        {payload.org.name} — period {payload.period.start ?? "genesis"} →{" "}
+        {payload.period.end ?? "now"} · generated{" "}
+        {payload.generated_at.slice(0, 16).replace("T", " ")} UTC by{" "}
+        {payload.issued_by}
+      </p>
+      <p class="muted">
+        Signed Ed25519, key <code>{doc.signature.key_id}</code> · report{" "}
+        <code>{row.id}</code> · control map v{payload.compliance_map_version}
+        {payload.ledger_anchor.chain_head && (
+          <>
+            {" "}· chain head #{payload.ledger_anchor.chain_head.seq}{" "}
+            <code>{payload.ledger_anchor.chain_head.hash.slice(0, 16)}…</code>
+          </>
+        )}
+      </p>
+      <p style="border-left:3px solid #0f172a;padding-left:0.8rem">
+        {payload.positioning}
+      </p>
+
+      <h2>Ledger integrity</h2>
+      {chain.ok ? (
+        <p style="color:#16a34a">
+          ✔ Hash chain verified at generation — {chain.count} events, none
+          altered.
+        </p>
+      ) : (
+        <p style="color:#dc2626">
+          ✘ Chain broken at event #{chain.brokenAtSeq}: {chain.reason}
+        </p>
+      )}
+
+      <h2>Activity in period</h2>
+      <table style="margin-bottom:1rem">
+        <tr>
+          <th>Purchases</th>
+          <td>
+            {payload.activity.purchases.total} requested (
+            {fmt(payload.activity.purchases.requested_cents)}) —{" "}
+            {counts(payload.activity.purchases.by_status)}
+          </td>
+        </tr>
+        <tr>
+          <th>Denials by rule</th>
+          <td>{counts(payload.activity.purchases.denied_by_rule)}</td>
+        </tr>
+        <tr>
+          <th>Mandates</th>
+          <td>
+            {payload.activity.mandates.verified} verified,{" "}
+            {payload.activity.mandates.rejected} rejected
+          </td>
+        </tr>
+        <tr>
+          <th>Bills</th>
+          <td>{counts(payload.activity.bills_by_recon_status)}</td>
+        </tr>
+        <tr>
+          <th>Settlements</th>
+          <td>{counts(payload.activity.settlements_by_match_status)}</td>
+        </tr>
+        <tr>
+          <th>Receipts issued</th>
+          <td>{payload.activity.receipts_issued}</td>
+        </tr>
+      </table>
+
+      {payload.frameworks.map((fw) => (
+        <>
+          <h2>{fw.name}</h2>
+          <p class="muted">
+            {fw.note} — {fw.summary.evidenced} evidenced,{" "}
+            {fw.summary.attention} needing attention, {fw.summary.no_activity}{" "}
+            with no activity.
+          </p>
+          <table style="margin-bottom:1.2rem">
+            <tr>
+              <th>Control</th>
+              <th>Status</th>
+              <th>Evidence</th>
+            </tr>
+            {fw.controls.map((control) => (
+              <tr>
+                <td style="min-width:14rem">
+                  <strong>{control.control_id}</strong> — {control.title}
+                  <div class="muted" style="margin-top:0.2rem">
+                    {control.rationale}
+                  </div>
+                </td>
+                <td>
+                  <EvidencePill status={control.status} />
+                </td>
+                <td>
+                  {control.evidence.map((e) => (
+                    <div style="margin-bottom:0.3rem">
+                      {e.detail}
+                      {e.refs && e.refs.length > 0 && (
+                        <span class="muted">
+                          {" "}
+                          (e.g. event #{e.refs[0].seq}{" "}
+                          <code>{e.refs[0].hash.slice(0, 12)}…</code>)
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </td>
+              </tr>
+            ))}
+          </table>
+        </>
+      ))}
+
+      <h2>Exceptions ({exceptionCount})</h2>
+      {exceptionCount === 0 ? (
+        <p style="color:#16a34a">✔ No exceptions in this period.</p>
+      ) : (
+        <>
+          {payload.exceptions.unauthorized_charges.map((s) => (
+            <p style="color:#dc2626">
+              ✘ Unauthorized charge: {s.vendor} {fmt(s.amount_cents)} on{" "}
+              {s.rail} at {s.occurred_at} — matches no approved purchase.
+            </p>
+          ))}
+          {payload.exceptions.settlement_amount_mismatches.map((s) => (
+            <p style="color:#dc2626">
+              ✘ Settlement mismatch: {s.vendor} on {s.rail} settled{" "}
+              {s.variance_cents !== null ? fmt(Math.abs(s.variance_cents)) : "?"}{" "}
+              {s.variance_cents !== null && s.variance_cents > 0 ? "over" : "off"}{" "}
+              the authorized amount
+              {s.matched_request_id && (
+                <>
+                  {" "}(purchase <code>{s.matched_request_id}</code>)
+                </>
+              )}
+              .
+            </p>
+          ))}
+          {payload.exceptions.overbilled_bills.map((b) => (
+            <p style="color:#dc2626">
+              ✘ Over-billed: {b.vendor} billed {fmt(b.amount_cents)},{" "}
+              {b.variance_cents !== null ? fmt(b.variance_cents) : "?"} above
+              recorded usage.
+            </p>
+          ))}
+          {payload.exceptions.frozen_agents.map((f) => (
+            <p style="color:#dc2626">
+              ✘ Agent <code>{f.agent_id}</code> is frozen since {f.frozen_at}:{" "}
+              {f.reason}
+            </p>
+          ))}
+        </>
+      )}
+      {payload.exceptions.policy_changes.length > 0 && (
+        <>
+          <h2>Policy changes in period</h2>
+          <table style="margin-bottom:1rem">
+            <tr>
+              <th>Version</th>
+              <th>Edited by</th>
+              <th>At (UTC)</th>
+              <th>Ledger seq</th>
+            </tr>
+            {payload.exceptions.policy_changes.map((p) => (
+              <tr>
+                <td>v{String(p.version)}</td>
+                <td>{String(p.edited_by)}</td>
+                <td>{p.at.slice(0, 16).replace("T", " ")}</td>
+                <td>#{p.seq}</td>
+              </tr>
+            ))}
+          </table>
+        </>
+      )}
+
+      <h2>How to verify this report</h2>
+      <p class="muted">{doc.verification_recipe.instructions}</p>
+    </Layout>
+  );
+});
+
+dashboard.get("/dashboard/reports/:id/report.json", async (c) => {
+  const row = await getComplianceReport(c.env.DB, c.get("orgId"), c.req.param("id"));
+  if (!row) return c.text("No such report", 404);
+  return c.body(row.report_json, 200, {
+    "content-type": "application/json",
+    "content-disposition": `attachment; filename="verispend-report-${row.id}.json"`,
+  });
 });
 
 dashboard.get("/dashboard/audit", async (c) => {

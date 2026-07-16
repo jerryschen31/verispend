@@ -156,10 +156,18 @@ describe("verifiable receipts end to end", () => {
     expect(anchor.ok).toBe(true);
     expect(anchor.checked).toBeGreaterThanOrEqual(6);
 
-    // Altering an anchored hash is caught.
+    // Altering an anchored hash is caught. Target an event the receipt
+    // actually anchors (control-plane events like org_created are not).
+    const anchoredSeq = (
+      JSON.parse(receipt.payload_json) as {
+        ledger_anchor: { events: Array<{ seq: number }> };
+      }
+    ).ledger_anchor.events[0].seq;
     const doctored = {
       ...bundle,
-      events: bundle.events.map((e, i) => (i === 1 ? { ...e, hash: "0".repeat(64) } : e)),
+      events: bundle.events.map((e) =>
+        e.seq === anchoredSeq ? { ...e, hash: "0".repeat(64) } : e
+      ),
     };
     expect(crossCheckAnchor(receipt as VerifiableReceipt, doctored).ok).toBe(false);
   });

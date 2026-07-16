@@ -364,32 +364,36 @@ export async function listAgentKeys(
   return results;
 }
 
+/** Returns the revoked key's agent_id, or null if no active key matched. */
 export async function revokeAgentKey(
   db: D1Database,
   orgId: string,
   keyId: string
-): Promise<void> {
-  await db
+): Promise<{ agentId: string | null }> {
+  const row = await db
     .prepare(
-      "UPDATE agent_keys SET revoked_at = ? WHERE org_id = ? AND id = ? AND revoked_at IS NULL"
+      `UPDATE agent_keys SET revoked_at = ? WHERE org_id = ? AND id = ? AND revoked_at IS NULL
+       RETURNING agent_id`
     )
     .bind(new Date().toISOString(), orgId, keyId)
-    .run();
+    .first<{ agent_id: string }>();
+  return { agentId: row?.agent_id ?? null };
 }
 
 /** Returns the plaintext key exactly once; only its hash is stored. */
 export async function createAgentKey(
   db: D1Database,
   args: { orgId: string; agentId: string }
-): Promise<{ apiKey: string }> {
+): Promise<{ apiKey: string; keyId: string }> {
   const apiKey = generateApiKey();
+  const keyId = `key_${crypto.randomUUID()}`;
   await db
     .prepare(
       "INSERT INTO agent_keys (id, org_id, agent_id, key_hash) VALUES (?, ?, ?, ?)"
     )
-    .bind(`key_${crypto.randomUUID()}`, args.orgId, args.agentId, await sha256Hex(apiKey))
+    .bind(keyId, args.orgId, args.agentId, await sha256Hex(apiKey))
     .run();
-  return { apiKey };
+  return { apiKey, keyId };
 }
 
 export async function insertPolicy(
@@ -759,17 +763,20 @@ export async function getMandateIssuer(
     .first<MandateIssuerRow>();
 }
 
+/** Returns the revoked registration's issuer name, or null if nothing matched. */
 export async function revokeMandateIssuer(
   db: D1Database,
   orgId: string,
   issuerId: string
-): Promise<void> {
-  await db
+): Promise<{ issuer: string | null }> {
+  const row = await db
     .prepare(
-      "UPDATE mandate_issuers SET revoked_at = ? WHERE org_id = ? AND id = ? AND revoked_at IS NULL"
+      `UPDATE mandate_issuers SET revoked_at = ? WHERE org_id = ? AND id = ? AND revoked_at IS NULL
+       RETURNING issuer`
     )
     .bind(new Date().toISOString(), orgId, issuerId)
-    .run();
+    .first<{ issuer: string }>();
+  return { issuer: row?.issuer ?? null };
 }
 
 export type PaymentMandateRow = {
@@ -1060,6 +1067,69 @@ export async function getLatestReceipt(
     )
     .bind(orgId, requestId)
     .first<ReceiptRow>();
+}
+
+// ---------- Compliance reports (Phase 4) ----------
+
+export type ComplianceReportRow = {
+  id: string;
+  org_id: string;
+  period_start: string | null;
+  period_end: string | null;
+  key_id: string;
+  payload_hash: string;
+  report_json: string;
+  issued_by: string;
+  created_at: string;
+};
+
+export async function insertComplianceReport(
+  db: D1Database,
+  row: Omit<ComplianceReportRow, "created_at">
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO compliance_reports
+         (id, org_id, period_start, period_end, key_id, payload_hash, report_json, issued_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      row.id,
+      row.org_id,
+      row.period_start,
+      row.period_end,
+      row.key_id,
+      row.payload_hash,
+      row.report_json,
+      row.issued_by
+    )
+    .run();
+}
+
+export async function getComplianceReport(
+  db: D1Database,
+  orgId: string,
+  reportId: string
+): Promise<ComplianceReportRow | null> {
+  return db
+    .prepare("SELECT * FROM compliance_reports WHERE org_id = ? AND id = ?")
+    .bind(orgId, reportId)
+    .first<ComplianceReportRow>();
+}
+
+export async function listComplianceReports(
+  db: D1Database,
+  orgId: string
+): Promise<Array<Omit<ComplianceReportRow, "report_json">>> {
+  const { results } = await db
+    .prepare(
+      `SELECT id, org_id, period_start, period_end, key_id, payload_hash, issued_by, created_at
+       FROM compliance_reports WHERE org_id = ?
+       ORDER BY created_at DESC, rowid DESC LIMIT 100`
+    )
+    .bind(orgId)
+    .all<Omit<ComplianceReportRow, "report_json">>();
+  return results;
 }
 
 /** The org's ledger chain tail — what a receipt anchors itself to. */
