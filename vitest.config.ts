@@ -29,6 +29,13 @@ export default defineConfig(async () => {
             KINDE_DOMAIN: "https://test-kinde.example",
             KINDE_CLIENT_ID: "test-client-id",
             KINDE_CLIENT_SECRET: "test-client-secret",
+            // Test-only Ed25519 signing key (never used outside tests).
+            RECEIPT_SIGNING_KEY: JSON.stringify({
+              kty: "OKP",
+              crv: "Ed25519",
+              x: "SDZ-jN-bJlQ6miAQfnvK62RvyJ4griojJEUkASJJW1I",
+              d: "Xc8qQX6MW_4uCVCJp_bkyRlNwWpuCBNFORJvRdmMrAw",
+            }),
           },
         },
       }),

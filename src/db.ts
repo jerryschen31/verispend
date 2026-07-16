@@ -1012,6 +1012,69 @@ export async function updateSettlementMatch(
     .run();
 }
 
+// ---------- Receipts (Phase 3: signed dispute evidence) ----------
+
+export type ReceiptRow = {
+  id: string;
+  org_id: string;
+  request_id: string;
+  key_id: string;
+  payload_hash: string;
+  receipt_json: string;
+  issued_by: string;
+  created_at: string;
+};
+
+export async function insertReceipt(
+  db: D1Database,
+  row: Omit<ReceiptRow, "created_at">
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO receipts
+         (id, org_id, request_id, key_id, payload_hash, receipt_json, issued_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      row.id,
+      row.org_id,
+      row.request_id,
+      row.key_id,
+      row.payload_hash,
+      row.receipt_json,
+      row.issued_by
+    )
+    .run();
+}
+
+export async function getLatestReceipt(
+  db: D1Database,
+  orgId: string,
+  requestId: string
+): Promise<ReceiptRow | null> {
+  return db
+    .prepare(
+      // created_at is second-granular; rowid breaks ties in insertion order.
+      `SELECT * FROM receipts WHERE org_id = ? AND request_id = ?
+       ORDER BY created_at DESC, rowid DESC LIMIT 1`
+    )
+    .bind(orgId, requestId)
+    .first<ReceiptRow>();
+}
+
+/** The org's ledger chain tail — what a receipt anchors itself to. */
+export async function getLedgerChainHead(
+  db: D1Database,
+  orgId: string
+): Promise<{ seq: number; hash: string } | null> {
+  return db
+    .prepare(
+      "SELECT seq, hash FROM ledger_events WHERE org_id = ? ORDER BY seq DESC LIMIT 1"
+    )
+    .bind(orgId)
+    .first<{ seq: number; hash: string }>();
+}
+
 export async function getRequestBySettlementRef(
   db: D1Database,
   orgId: string,
@@ -1043,8 +1106,9 @@ export async function getRequestByApprovalRef(
 
 /**
  * Approved/completed purchases from this vendor not yet claimed by any
- * settlement, oldest first. Amount tolerance and the time window are applied
- * by the caller (per-row math is clearer in TS than SQL).
+ * settlement, oldest first (created_at is second-granular, so rowid breaks
+ * ties in true insertion order). Amount tolerance and the time window are
+ * applied by the caller (per-row math is clearer in TS than SQL).
  */
 export async function findHeuristicMatchCandidates(
   db: D1Database,
@@ -1061,7 +1125,7 @@ export async function findHeuristicMatchCandidates(
            SELECT 1 FROM settlements s
            WHERE s.org_id = pr.org_id AND s.matched_request_id = pr.id
          )
-       ORDER BY pr.created_at ASC, pr.id ASC LIMIT ?`
+       ORDER BY pr.created_at ASC, pr.rowid ASC LIMIT ?`
     )
     .bind(orgId, vendor, limit)
     .all<PurchaseRequestRow>();

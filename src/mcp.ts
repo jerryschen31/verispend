@@ -3,18 +3,20 @@ import { McpAgent } from "agents/mcp";
 import { z } from "zod";
 import {
   getActivePolicy,
+  getLatestReceipt,
   getOrg,
   getPurchaseRequest,
+  getSettlementByRef,
   getTeamForAgent,
   insertDecisionToken,
   insertPaymentMandate,
-  getSettlementByRef,
   insertPurchaseRequest,
   insertUsageRecord,
   markOutcomeRecorded,
   updateSettlementMatch,
   type TeamRow,
 } from "./db";
+import { issueReceipt } from "./receipts";
 import { verifyMandate, type MandateVerification } from "./mandate";
 import { classifyMatch } from "./settlements";
 import { resolveReconciliationRules } from "./reconcile";
@@ -577,6 +579,33 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           variance_from_approval_cents: deltaCents,
           settlement_match: rematched ?? undefined,
         });
+      }
+    );
+
+    this.server.registerTool(
+      "get_receipt",
+      {
+        description:
+          "Fetch the signed verifiable receipt for a decided purchase — proof " +
+          "of what was authorized, under what limits, and how it matched the " +
+          "actual charge. Issues a fresh receipt if none exists yet. Best " +
+          "called after record_outcome so the receipt captures the settlement.",
+        inputSchema: {
+          request_id: z.string().describe("The request_id to attest"),
+        },
+      },
+      async ({ request_id }) => {
+        const existing = await getLatestReceipt(db, orgId, request_id);
+        if (existing) {
+          return json(JSON.parse(existing.receipt_json));
+        }
+        const result = await issueReceipt(this.env, {
+          orgId,
+          requestId: request_id,
+          issuedBy: `mcp:${agentId}`,
+        });
+        if (!result.ok) return jsonError(result.error);
+        return json(result.receipt);
       }
     );
 

@@ -22,6 +22,8 @@ import type { BudgetLimits } from "./policy";
 import { buildAuditBundle, exportPurchasesCsv } from "./export";
 import { ingestBill } from "./reconcile";
 import { ingestSettlement } from "./settlements";
+import { issueReceipt, listReceiptKeys } from "./receipts";
+import { getLatestReceipt } from "./db";
 import { MANDATE_ALGS, MANDATE_SCHEMES } from "./mandate";
 import { DEFAULT_POLICY, type PolicyRules } from "./policy";
 import { VeriSpendMCP } from "./mcp";
@@ -32,6 +34,13 @@ export { VeriSpendMCP, OrgCoordinator };
 const app = new Hono<{ Bindings: Env }>();
 
 app.get("/health", (c) => c.json({ ok: true, service: "verispend" }));
+
+// Public receipt-signing keys (Phase 3): the out-of-band anchor a relying
+// party checks a receipt's key_id against. Serves the current key plus every
+// key that ever signed a stored receipt, so rotation never orphans one.
+app.get("/.well-known/verispend-keys.json", async (c) => {
+  return c.json({ keys: await listReceiptKeys(c.env) });
+});
 
 app.get("/", (c) => c.redirect("/dashboard"));
 app.route("/", dashboard);
@@ -339,6 +348,36 @@ app.post("/api/admin/orgs/:orgId/settlements", async (c) => {
     );
   }
   return c.json({ results });
+});
+
+// Verifiable receipts (Phase 3): issue a freshly signed receipt for a
+// decided purchase, or fetch the newest one. The dashboard's request-detail
+// page is the session-guarded equivalent.
+app.post("/api/admin/orgs/:orgId/requests/:requestId/receipt", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  if (!(await getOrg(c.env.DB, orgId))) {
+    return c.json({ error: "no such org" }, 404);
+  }
+  const result = await issueReceipt(c.env, {
+    orgId,
+    requestId: c.req.param("requestId"),
+    issuedBy: "admin-api",
+  });
+  if (!result.ok) return c.json({ error: result.error }, 400);
+  return c.json(result.receipt);
+});
+
+app.get("/api/admin/orgs/:orgId/requests/:requestId/receipt.json", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  const row = await getLatestReceipt(c.env.DB, orgId, c.req.param("requestId"));
+  if (!row) return c.json({ error: "no receipt issued for this request" }, 404);
+  return c.body(row.receipt_json, 200, { "content-type": "application/json" });
 });
 
 // Admin-key twins of the dashboard exports, for the simulator and CI (no

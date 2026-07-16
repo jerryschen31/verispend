@@ -21,7 +21,8 @@ export type LedgerEventType =
   | "mandate_rejected"
   | "settlement_ingested"
   | "settlement_matched"
-  | "unauthorized_charge";
+  | "unauthorized_charge"
+  | "receipt_issued";
 
 export type LedgerAppend = {
   orgId: string;
