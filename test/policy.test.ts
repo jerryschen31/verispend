@@ -119,6 +119,62 @@ describe("evaluatePolicy", () => {
   });
 });
 
+describe("evaluatePolicy mandate requirements", () => {
+  const withRequire = (
+    require: NonNullable<PolicyRules["mandates"]>["require"]
+  ): PolicyRules => ({ ...rules, mandates: { require } });
+
+  it("is skipped as not configured when the policy has no mandates section", () => {
+    const { trace, decision } = evaluatePolicy(rules, intent({}));
+    expect(decision).toBe("approved");
+    expect(trace.find((t) => t.rule === "mandate_missing")).toMatchObject({
+      result: "skipped",
+      detail: "not configured",
+    });
+  });
+
+  it("denies above the amount threshold without a verified mandate", () => {
+    const mandated = withRequire({ amountCentsAtLeast: 100_00 });
+    expect(evaluatePolicy(mandated, intent({ amountCents: 100_00 }))).toMatchObject({
+      decision: "denied",
+      ruleFired: "mandate_missing",
+    });
+    expect(
+      evaluatePolicy(mandated, intent({ amountCents: 99_99 })).decision
+    ).toBe("approved");
+  });
+
+  it("passes when a verified mandate covers the purchase", () => {
+    const mandated = withRequire({ amountCentsAtLeast: 100_00 });
+    const result = evaluatePolicy(
+      mandated,
+      intent({ amountCents: 150_00, mandateVerified: true })
+    );
+    expect(result.decision).toBe("approved");
+    expect(result.trace.find((t) => t.rule === "mandate_missing")).toMatchObject({
+      result: "pass",
+    });
+  });
+
+  it("matches on category, case-insensitively", () => {
+    const mandated = withRequire({ categories: ["Travel"] });
+    expect(
+      evaluatePolicy(mandated, intent({ category: "travel" }))
+    ).toMatchObject({ decision: "denied", ruleFired: "mandate_missing" });
+    expect(evaluatePolicy(mandated, intent({})).decision).toBe("approved");
+  });
+
+  it("requires a mandate for every purchase when configured with no filters", () => {
+    expect(evaluatePolicy(withRequire({}), intent({}))).toMatchObject({
+      decision: "denied",
+      ruleFired: "mandate_missing",
+    });
+    expect(
+      evaluatePolicy(withRequire({}), intent({ mandateVerified: true })).decision
+    ).toBe("approved");
+  });
+});
+
 describe("evaluatePolicy trace", () => {
   const ALL_RULES = [
     "invalid_amount",
@@ -128,6 +184,7 @@ describe("evaluatePolicy trace", () => {
     "category_denied",
     "category_not_allowed",
     "over_transaction_cap",
+    "mandate_missing",
     "escalation_category",
     "escalation_amount",
   ];

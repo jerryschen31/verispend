@@ -7,11 +7,13 @@ import {
   getPurchaseRequest,
   getTeamForAgent,
   insertDecisionToken,
+  insertPaymentMandate,
   insertPurchaseRequest,
   insertUsageRecord,
   markOutcomeRecorded,
   type TeamRow,
 } from "./db";
+import { verifyMandate, type MandateVerification } from "./mandate";
 import {
   resolveApprovers,
   sendApprovalEmail,
@@ -114,9 +116,16 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
             .string()
             .min(1)
             .describe("Why this purchase serves the task you were given"),
+          mandate: z
+            .string()
+            .optional()
+            .describe(
+              "Signed payment mandate credential (compact JWS) issued by a " +
+                "payment network, if you hold one for this purchase"
+            ),
         },
       },
-      async ({ vendor, amount_cents, currency, category, justification }) => {
+      async ({ vendor, amount_cents, currency, category, justification, mandate }) => {
         const policy = await getActivePolicy(db, orgId);
         if (!policy) {
           return jsonError("No spend policy configured for this org.");
@@ -142,6 +151,7 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
         });
 
         let decision: EvaluatedDecision;
+        let mandateResult: MandateVerification | null = null;
         if (breaker.status === "frozen") {
           const reason =
             `This agent is frozen by the circuit breaker (since ${breaker.frozenAt}): ` +
@@ -160,6 +170,24 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
             reason,
             trace: [{ rule: "circuit_breaker", result: "triggered", detail: reason }],
           };
+        } else if (mandate !== undefined) {
+          // A presented-but-failing credential is a hard deny: an agent waving
+          // a bad permission slip is worse than one presenting none.
+          mandateResult = await verifyMandate(db, orgId, mandate, intent);
+          if (!mandateResult.ok) {
+            decision = {
+              decision: "denied",
+              ruleFired: mandateResult.ruleFired,
+              reason: mandateResult.reason,
+              trace: mandateResult.trace,
+            };
+          } else {
+            decision = evaluatePolicy(policy.rules, {
+              ...intent,
+              mandateVerified: true,
+            });
+            decision.trace = [...mandateResult.trace, ...decision.trace];
+          }
         } else {
           decision = evaluatePolicy(policy.rules, intent);
         }
@@ -237,6 +265,26 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           team_id: decision.decision === "approved" ? team?.id ?? null : null,
         });
 
+        if (mandateResult) {
+          const p = mandateResult.presentation;
+          await insertPaymentMandate(db, {
+            id: `mand_${crypto.randomUUID()}`,
+            org_id: orgId,
+            request_id: requestId,
+            issuer_id: p.issuerId,
+            scheme: p.scheme,
+            issuer: p.issuer,
+            subject: p.subject,
+            mandate_ref: p.mandateRef,
+            scope_json: JSON.stringify(p.scope),
+            not_before: p.notBefore,
+            expires_at: p.expiresAt,
+            token_hash: p.tokenHash,
+            raw_token: mandate ?? "",
+            verification_status: p.status,
+          });
+        }
+
         let routed: { emails: string[]; source: string } | null = null;
         if (!decidedNow) {
           routed = await resolveApprovers(db, orgId, agentId);
@@ -271,6 +319,26 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           eventType: "purchase_requested",
           payload: { ...intent },
         });
+        if (mandateResult) {
+          const p = mandateResult.presentation;
+          await org().appendEvent({
+            orgId,
+            requestId,
+            eventType: mandateResult.ok ? "mandate_verified" : "mandate_rejected",
+            payload: {
+              scheme: p.scheme,
+              issuer: p.issuer,
+              subject: p.subject,
+              mandateRef: p.mandateRef,
+              scope: p.scope,
+              notBefore: p.notBefore,
+              expiresAt: p.expiresAt,
+              tokenHash: p.tokenHash,
+              status: p.status,
+              reason: mandateResult.ok ? null : mandateResult.reason,
+            },
+          });
+        }
         await org().appendEvent({
           orgId,
           requestId,
@@ -325,6 +393,14 @@ export class VeriSpendMCP extends McpAgent<Env, unknown, Props> {
           reason: "reason" in decision ? decision.reason : undefined,
           trace: decision.trace,
           budget: budgetDenied ?? undefined,
+          mandate: mandateResult
+            ? {
+                status: mandateResult.presentation.status,
+                scheme: mandateResult.presentation.scheme,
+                issuer: mandateResult.presentation.issuer,
+                mandate_ref: mandateResult.presentation.mandateRef,
+              }
+            : undefined,
           approval_ref: approvalRef ?? undefined,
           next_step:
             decision.decision === "approved"

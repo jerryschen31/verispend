@@ -10,7 +10,9 @@ import {
   getActivePolicy,
   getMembership,
   getOrg,
+  insertMandateIssuer,
   insertPolicy,
+  revokeMandateIssuer,
   setAgentTeam,
   setTeamApprover,
   upsertMember,
@@ -19,6 +21,7 @@ import {
 import type { BudgetLimits } from "./policy";
 import { buildAuditBundle, exportPurchasesCsv } from "./export";
 import { ingestBill } from "./reconcile";
+import { MANDATE_ALGS, MANDATE_SCHEMES } from "./mandate";
 import { DEFAULT_POLICY, type PolicyRules } from "./policy";
 import { VeriSpendMCP } from "./mcp";
 import { OrgCoordinator } from "./org-do";
@@ -199,6 +202,59 @@ app.post("/api/admin/orgs/:orgId/teams", async (c) => {
   }
 
   return c.json({ team_id: teamId, policy_version: policyVersion });
+});
+
+// Trusted mandate-issuer registry (Phase 3). VeriSpend accepts payment
+// mandates only from issuers whose public keys an org registered here —
+// registering a real network's published key is the entire "integration".
+// The dashboard's issuers page is the session-guarded equivalent.
+app.post("/api/admin/orgs/:orgId/issuers", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  if (!(await getOrg(c.env.DB, orgId))) {
+    return c.json({ error: "no such org" }, 404);
+  }
+  const body = await c.req.json<{
+    issuer?: string;
+    scheme?: string;
+    alg?: string;
+    public_key_jwk?: Record<string, unknown>;
+  }>();
+  if (!body.issuer?.trim()) return c.json({ error: "issuer is required" }, 400);
+  if (!body.scheme || !(MANDATE_SCHEMES as readonly string[]).includes(body.scheme)) {
+    return c.json(
+      { error: `scheme must be one of: ${MANDATE_SCHEMES.join(", ")}` },
+      400
+    );
+  }
+  if (!body.alg || !(MANDATE_ALGS as readonly string[]).includes(body.alg)) {
+    return c.json({ error: `alg must be one of: ${MANDATE_ALGS.join(", ")}` }, 400);
+  }
+  if (typeof body.public_key_jwk !== "object" || body.public_key_jwk === null) {
+    return c.json({ error: "public_key_jwk must be a JWK object" }, 400);
+  }
+  const { issuerId } = await insertMandateIssuer(c.env.DB, {
+    orgId,
+    issuer: body.issuer,
+    scheme: body.scheme,
+    alg: body.alg,
+    publicKeyJwk: JSON.stringify(body.public_key_jwk),
+  });
+  return c.json({ issuer_id: issuerId });
+});
+
+app.post("/api/admin/orgs/:orgId/issuers/:issuerId/revoke", async (c) => {
+  if (!(await requireAdminKey(c))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const orgId = c.req.param("orgId");
+  if (!(await getOrg(c.env.DB, orgId))) {
+    return c.json({ error: "no such org" }, 404);
+  }
+  await revokeMandateIssuer(c.env.DB, orgId, c.req.param("issuerId"));
+  return c.json({ ok: true });
 });
 
 // Bill ingestion for API-driven workflows (and the agent simulator). The

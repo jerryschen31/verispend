@@ -682,6 +682,150 @@ export async function listBilledCharges(
   return results;
 }
 
+// ---------- Payment mandates (Phase 3: externally issued credentials) ----------
+
+export type MandateIssuerRow = {
+  id: string;
+  org_id: string;
+  issuer: string;
+  scheme: string;
+  alg: string;
+  public_key_jwk: string;
+  created_at: string;
+  revoked_at: string | null;
+};
+
+/** Registering an issuer that already exists replaces its key (rotation). */
+export async function insertMandateIssuer(
+  db: D1Database,
+  args: {
+    orgId: string;
+    issuer: string;
+    scheme: string;
+    alg: string;
+    publicKeyJwk: string;
+  }
+): Promise<{ issuerId: string }> {
+  const id = `iss_${crypto.randomUUID()}`;
+  await db
+    .prepare(
+      `INSERT INTO mandate_issuers (id, org_id, issuer, scheme, alg, public_key_jwk)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT (org_id, issuer) DO UPDATE SET
+         scheme = excluded.scheme, alg = excluded.alg,
+         public_key_jwk = excluded.public_key_jwk, revoked_at = NULL`
+    )
+    .bind(id, args.orgId, args.issuer.trim(), args.scheme, args.alg, args.publicKeyJwk)
+    .run();
+  const row = await db
+    .prepare("SELECT id FROM mandate_issuers WHERE org_id = ? AND issuer = ?")
+    .bind(args.orgId, args.issuer.trim())
+    .first<{ id: string }>();
+  return { issuerId: row?.id ?? id };
+}
+
+export async function listMandateIssuers(
+  db: D1Database,
+  orgId: string
+): Promise<MandateIssuerRow[]> {
+  const { results } = await db
+    .prepare(
+      "SELECT * FROM mandate_issuers WHERE org_id = ? ORDER BY created_at, issuer"
+    )
+    .bind(orgId)
+    .all<MandateIssuerRow>();
+  return results;
+}
+
+/** Active (non-revoked) issuer registration for an "iss" claim, if any. */
+export async function getMandateIssuer(
+  db: D1Database,
+  orgId: string,
+  issuer: string
+): Promise<MandateIssuerRow | null> {
+  return db
+    .prepare(
+      "SELECT * FROM mandate_issuers WHERE org_id = ? AND issuer = ? AND revoked_at IS NULL"
+    )
+    .bind(orgId, issuer.trim())
+    .first<MandateIssuerRow>();
+}
+
+export async function revokeMandateIssuer(
+  db: D1Database,
+  orgId: string,
+  issuerId: string
+): Promise<void> {
+  await db
+    .prepare(
+      "UPDATE mandate_issuers SET revoked_at = ? WHERE org_id = ? AND id = ? AND revoked_at IS NULL"
+    )
+    .bind(new Date().toISOString(), orgId, issuerId)
+    .run();
+}
+
+export type PaymentMandateRow = {
+  id: string;
+  org_id: string;
+  request_id: string;
+  issuer_id: string | null;
+  scheme: string;
+  issuer: string;
+  subject: string;
+  mandate_ref: string;
+  scope_json: string;
+  not_before: string | null;
+  expires_at: string | null;
+  token_hash: string;
+  raw_token: string;
+  verification_status: string;
+  created_at: string;
+};
+
+export async function insertPaymentMandate(
+  db: D1Database,
+  row: Omit<PaymentMandateRow, "created_at">
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO payment_mandates
+         (id, org_id, request_id, issuer_id, scheme, issuer, subject, mandate_ref,
+          scope_json, not_before, expires_at, token_hash, raw_token, verification_status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      row.id,
+      row.org_id,
+      row.request_id,
+      row.issuer_id,
+      row.scheme,
+      row.issuer,
+      row.subject,
+      row.mandate_ref,
+      row.scope_json,
+      row.not_before,
+      row.expires_at,
+      row.token_hash,
+      row.raw_token,
+      row.verification_status
+    )
+    .run();
+}
+
+export async function getMandateForRequest(
+  db: D1Database,
+  orgId: string,
+  requestId: string
+): Promise<PaymentMandateRow | null> {
+  return db
+    .prepare(
+      `SELECT * FROM payment_mandates WHERE org_id = ? AND request_id = ?
+       ORDER BY created_at DESC, id DESC LIMIT 1`
+    )
+    .bind(orgId, requestId)
+    .first<PaymentMandateRow>();
+}
+
 export type LedgerEventRow = {
   seq: number;
   org_id: string;
